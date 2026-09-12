@@ -1,0 +1,30 @@
+{
+  "_comment": "Copy to config.json and add your key. config.json is gitignored.",
+  "api_key": "YOUR-TICKETMASTER-CONSUMER-KEY",
+
+  "keyword": "Sienna Spiro",
+  "cities": ["Toronto"],
+  "country_code": "CA",
+  "attraction_id": null,
+
+  "interval_seconds": 60,
+  "repeat_alert_minutes": 0,
+  "alert_on": ["new_event", "on_sale", "presale", "back_in_stock", "low_inventory"],
+
+  "state_file": "state.json",
+  "log_level": "INFO",
+
+  "notifiers": {
+    "console": true,
+    "desktop": true,
+    "open_browser": false,
+    "ntfy_topic": null,
+    "webhook_url": null,
+    "command": null,
+    "email_to": null,
+    "smtp_host": null,
+    "smtp_port": 587,
+    "smtp_user": null,
+    "smtp_password": null
+  }
+}

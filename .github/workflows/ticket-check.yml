@@ -1,0 +1,55 @@
+# Optional: let GitHub do the polling so you do not need a machine left on.
+#
+# Setup:
+#   1. Repo Settings -> Secrets and variables -> Actions -> New repository secret
+#        TICKETMASTER_API_KEY = your consumer key
+#        NTFY_TOPIC           = a hard-to-guess topic name (install the ntfy app,
+#                               subscribe to the same topic to get phone pushes)
+#   2. Actions tab -> enable workflows.
+#
+# Caveat: GitHub's scheduler is best effort and will not run more often than
+# every 5 minutes - often less. For a fast-moving onsale, run `ticketwatch watch`
+# on a real machine instead and use this as a backstop.
+name: ticket-check
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ticket-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Carry the "what we already told you about" file between runs so you are
+      # not pinged every five minutes about the same show.
+      - name: Restore monitor state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: ticketwatch-state-${{ github.run_id }}
+          restore-keys: ticketwatch-state-
+
+      - name: Check Ticketmaster
+        env:
+          TICKETMASTER_API_KEY: ${{ secrets.TICKETMASTER_API_KEY }}
+          TICKETWATCH_NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TICKETWATCH_DESKTOP: "0"
+        run: |
+          set +e
+          python -m ticketwatch check \
+            --keyword "Sienna Spiro" \
+            --city Toronto \
+            --state-file state.json
+          code=$?
+          # 0 = tickets are buyable, 1 = not yet (both fine), 2 = real failure.
+          if [ "$code" -gt 1 ]; then exit "$code"; fi

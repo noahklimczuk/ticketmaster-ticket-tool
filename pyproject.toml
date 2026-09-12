@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ticketwatch"
+version = "1.0.0"
+description = "Watch Ticketmaster and get told the moment tickets are actually buyable."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+ticketwatch = "ticketwatch.cli:main"
+
+[tool.setuptools]
+packages = ["ticketwatch"]

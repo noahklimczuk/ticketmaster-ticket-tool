@@ -1,0 +1,17 @@
+# Your key lives in config.json - never commit it.
+config.json
+ticketwatch.json
+
+# Runtime files
+state.json
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
