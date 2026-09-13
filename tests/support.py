@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socketserver
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Tuple
@@ -157,3 +158,94 @@ def events_response(events: List[Dict[str, Any]], page: int = 0, total_pages: in
         "_embedded": {"events": events},
         "page": {"size": 50, "totalElements": len(events), "totalPages": total_pages, "number": page},
     }
+
+
+# --------------------------------------------------------------------------- #
+# a minimal SMTP server, so the real sending path is exercised too
+# --------------------------------------------------------------------------- #
+class _SMTPHandler(socketserver.StreamRequestHandler):
+    """Enough of SMTP to accept a message from smtplib and remember it."""
+
+    def _say(self, text: str) -> None:
+        self.wfile.write(text.encode("ascii") + b"\r\n")
+        self.wfile.flush()
+
+    def handle(self) -> None:
+        self._say("220 mock.test ESMTP ready")
+        collecting = False
+        lines: List[str] = []
+        while True:
+            raw = self.rfile.readline()
+            if not raw:
+                return
+            line = raw.decode("utf-8", errors="replace")
+
+            if collecting:
+                if line.strip() == ".":
+                    collecting = False
+                    self.server.messages.append("".join(lines))
+                    lines = []
+                    self._say("250 2.0.0 Message accepted")
+                else:
+                    lines.append(line)
+                continue
+
+            command = line.strip()
+            verb = command.split(" ", 1)[0].upper()
+            if verb in ("EHLO", "HELO"):
+                self._say("250-mock.test")
+                self._say("250 AUTH PLAIN")
+            elif verb == "AUTH":
+                self.server.auth_attempts.append(command)
+                if self.server.reject_auth:
+                    self._say("535 5.7.8 Username and Password not accepted")
+                else:
+                    self._say("235 2.7.0 Accepted")
+            elif verb == "DATA":
+                collecting = True
+                self._say("354 End data with <CR><LF>.<CR><LF>")
+            elif verb == "QUIT":
+                self._say("221 2.0.0 Bye")
+                return
+            else:  # MAIL FROM, RCPT TO, RSET, NOOP...
+                self._say("250 2.1.0 OK")
+
+
+class MockSMTPServer:
+    """A throwaway SMTP server on 127.0.0.1 that records what it is sent."""
+
+    def __init__(self, reject_auth: bool = False) -> None:
+        self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _SMTPHandler)
+        # Without these, server_close() joins every handler thread - and one
+        # still sitting in readline() would hang the whole test run.
+        self.server.daemon_threads = True
+        self.server.block_on_close = False
+        self.server.messages: List[str] = []
+        self.server.auth_attempts: List[str] = []
+        self.server.reject_auth = reject_auth
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+
+    def __enter__(self) -> "MockSMTPServer":
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    @property
+    def host(self) -> str:
+        return self.server.server_address[0]
+
+    @property
+    def port(self) -> int:
+        return self.server.server_address[1]
+
+    @property
+    def messages(self) -> List[str]:
+        return self.server.messages
+
+    @property
+    def auth_attempts(self) -> List[str]:
+        return self.server.auth_attempts

@@ -7,7 +7,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from tests.support import MockServer, event_payload, events_response
+from tests.support import MockServer, MockSMTPServer, event_payload, events_response
 from ticketwatch import cli
 
 
@@ -190,6 +190,87 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(code, cli.EXIT_ERROR)
         self.assertIn("already exists", err)
         self.assertEqual(self.run_cli(["init", str(path), "--force"])[0], cli.EXIT_OK)
+
+    # -- setup-email -----------------------------------------------------
+    def test_setup_email_works_out_gmail_from_the_address(self):
+        config = self.dir / "config.json"
+        code, out, _ = self.run_cli([
+            "setup-email", "someone@gmail.com", "-c", str(config), "--password", "abcd efgh ijkl mnop", "--no-test",
+        ])
+        self.assertEqual(code, cli.EXIT_OK)
+        saved = json.loads(config.read_text(encoding="utf-8"))["notifiers"]
+        self.assertEqual(saved["email_to"], "someone@gmail.com")
+        self.assertEqual(saved["email_from"], "someone@gmail.com")
+        self.assertEqual(saved["smtp_host"], "smtp.gmail.com")
+        self.assertEqual(saved["smtp_port"], 587)
+        self.assertEqual(saved["smtp_password"], "abcdefghijklmnop")
+        self.assertIn("app password", out)
+
+    def test_setup_email_locks_the_config_file_down(self):
+        config = self.dir / "config.json"
+        self.run_cli(["setup-email", "a@gmail.com", "-c", str(config), "--password", "x", "--no-test"])
+        self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+
+    def test_setup_email_keeps_the_rest_of_the_config(self):
+        config = self.write_config(keyword="Someone Else", interval_seconds=45)
+        self.run_cli(["setup-email", "a@gmail.com", "-c", str(config), "--password", "x", "--no-test"])
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        self.assertEqual(saved["keyword"], "Someone Else")
+        self.assertEqual(saved["interval_seconds"], 45)
+        self.assertEqual(saved["api_key"], "TEST-KEY")
+        self.assertFalse(saved["notifiers"]["console"])  # untouched
+        self.assertEqual(saved["notifiers"]["email_to"], "a@gmail.com")
+
+    def test_setup_email_can_keep_the_password_out_of_the_file(self):
+        config = self.dir / "config.json"
+        code, out, _ = self.run_cli([
+            "setup-email", "a@gmail.com", "-c", str(config), "--password", "x", "--no-store-password", "--no-test",
+        ])
+        self.assertEqual(code, cli.EXIT_OK)
+        self.assertIsNone(json.loads(config.read_text(encoding="utf-8"))["notifiers"]["smtp_password"])
+        self.assertIn("TICKETWATCH_SMTP_PASSWORD", out)
+
+    def test_setup_email_rejects_nonsense(self):
+        code, _, err = self.run_cli(["setup-email", "not-an-address", "-c", str(self.dir / "c.json"), "--no-test"])
+        self.assertEqual(code, cli.EXIT_ERROR)
+        self.assertIn("email address", err)
+
+    def test_setup_email_needs_a_password_when_nobody_can_be_asked(self):
+        code, _, err = self.run_cli(["setup-email", "a@gmail.com", "-c", str(self.dir / "c.json"), "--no-test"])
+        self.assertEqual(code, cli.EXIT_ERROR)
+        self.assertIn("TICKETWATCH_SMTP_PASSWORD", err)
+
+    def test_setup_email_needs_a_host_for_an_unknown_provider(self):
+        code, _, _ = self.run_cli([
+            "setup-email", "a@some-company.test", "-c", str(self.dir / "c.json"), "--password", "x", "--no-test",
+        ])
+        self.assertEqual(code, cli.EXIT_ERROR)
+
+    def test_setup_email_sends_a_real_test_message(self):
+        config = self.dir / "config.json"
+        with MockSMTPServer() as smtp:
+            code, out, err = self.run_cli([
+                "setup-email", "noah@example.test", "-c", str(config),
+                "--smtp-host", smtp.host, "--smtp-port", str(smtp.port),
+                "--no-starttls", "--password", "app-password",
+            ])
+            messages = list(smtp.messages)
+        self.assertEqual(code, cli.EXIT_OK, err)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("To: noah@example.test", messages[0])
+        self.assertIn("Sent.", out)
+
+    def test_setup_email_reports_a_failed_send(self):
+        config = self.dir / "config.json"
+        with MockSMTPServer(reject_auth=True) as smtp:
+            code, _, err = self.run_cli([
+                "setup-email", "noah@example.test", "-c", str(config),
+                "--smtp-host", smtp.host, "--smtp-port", str(smtp.port),
+                "--no-starttls", "--password", "wrong",
+            ])
+        self.assertEqual(code, cli.EXIT_ERROR)
+        self.assertIn("Could not send", err)
+        self.assertTrue(config.exists())  # settings are kept so you can retry
 
     # -- config errors ---------------------------------------------------
     def test_a_missing_config_file_is_reported(self):

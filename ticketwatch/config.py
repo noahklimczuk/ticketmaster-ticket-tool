@@ -14,6 +14,30 @@ from typing import Any, Dict, List, Optional
 
 DEFAULT_CONFIG_FILENAMES = ("config.json", "ticketwatch.json")
 
+# Mail servers we can work out from the address, so the only thing you have to
+# supply is your address and an app password.
+SMTP_PROVIDERS = {
+    "gmail.com": ("smtp.gmail.com", 587),
+    "googlemail.com": ("smtp.gmail.com", 587),
+    "outlook.com": ("smtp-mail.outlook.com", 587),
+    "hotmail.com": ("smtp-mail.outlook.com", 587),
+    "live.com": ("smtp-mail.outlook.com", 587),
+    "msn.com": ("smtp-mail.outlook.com", 587),
+    "yahoo.com": ("smtp.mail.yahoo.com", 587),
+    "yahoo.ca": ("smtp.mail.yahoo.com", 587),
+    "icloud.com": ("smtp.mail.me.com", 587),
+    "me.com": ("smtp.mail.me.com", 587),
+    "mac.com": ("smtp.mail.me.com", 587),
+    "fastmail.com": ("smtp.fastmail.com", 587),
+    # Proton needs Bridge running locally; these are its defaults.
+    "proton.me": ("127.0.0.1", 1025),
+    "protonmail.com": ("127.0.0.1", 1025),
+}
+
+# Providers that will reject your normal password outright.
+APP_PASSWORD_REQUIRED = {"smtp.gmail.com", "smtp.mail.yahoo.com", "smtp.mail.me.com"}
+
+
 # Alert kinds that count as "you can spend money right now".
 BUYABLE_ALERTS = ("new_event", "on_sale", "presale", "back_in_stock", "low_inventory")
 ALL_ALERTS = BUYABLE_ALERTS + ("sold_out", "status_change", "price_change", "gone", "error")
@@ -41,6 +65,34 @@ class NotifierSettings:
     smtp_user: Optional[str] = None
     smtp_password: Optional[str] = None
     smtp_starttls: bool = True
+
+    def apply_email_defaults(self) -> None:
+        """Fill in the boring SMTP bits from the address. Safe to call twice.
+
+        Give it `email_to` and a password and everything else follows: you send
+        to yourself, from yourself, through your provider's server.
+        """
+        if not self.email_to:
+            return
+        if not self.smtp_user:
+            self.smtp_user = self.email_to
+        if not self.email_from:
+            self.email_from = self.smtp_user
+        if not self.smtp_host:
+            domain = (self.smtp_user or "").rpartition("@")[2].lower()
+            provider = SMTP_PROVIDERS.get(domain)
+            if provider:
+                self.smtp_host, port = provider
+                if self.smtp_port == 587:  # only override a port nobody chose
+                    self.smtp_port = port
+
+    @property
+    def needs_app_password(self) -> bool:
+        return (self.smtp_host or "") in APP_PASSWORD_REQUIRED
+
+    @property
+    def email_ready(self) -> bool:
+        return bool(self.email_to and self.smtp_host)
 
 
 @dataclass
@@ -160,6 +212,8 @@ def _apply_mapping(cfg: Config, data: Dict[str, Any], source: str) -> None:
             if not isinstance(value, dict):
                 raise ConfigError(f'"notifiers" in {source} must be an object')
             for nkey, nvalue in value.items():
+                if nkey.startswith("_"):
+                    continue  # comment-ish keys are allowed here too
                 if nkey not in notifier_known:
                     raise ConfigError(f'Unknown notifier option "{nkey}" in {source}')
                 setattr(cfg.notifiers, nkey, _coerce(cfg.notifiers, nkey, nvalue))
@@ -235,6 +289,8 @@ def build_config(
     if cli_overrides:
         clean = {k: v for k, v in cli_overrides.items() if v is not None}
         _apply_mapping(cfg, clean, "command line")
+
+    cfg.notifiers.apply_email_defaults()
 
     # Relative paths in a config file are resolved next to that file, so the
     # monitor can be launched from anywhere (cron, systemd, launchd).

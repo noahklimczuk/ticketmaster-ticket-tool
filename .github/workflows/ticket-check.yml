@@ -3,8 +3,13 @@
 # Setup:
 #   1. Repo Settings -> Secrets and variables -> Actions -> New repository secret
 #        TICKETMASTER_API_KEY = your consumer key
+#      Then at least one way to be told - secrets, so your address stays out of
+#      this public repo:
 #        NTFY_TOPIC           = a hard-to-guess topic name (install the ntfy app,
 #                               subscribe to the same topic to get phone pushes)
+#        ALERT_EMAIL          = where to email alerts
+#        SMTP_APP_PASSWORD    = the app password for that address
+#                               (Gmail: https://myaccount.google.com/apppasswords)
 #   2. Actions tab -> enable workflows.
 #
 # Caveat: GitHub's scheduler is best effort and will not run more often than
@@ -43,6 +48,8 @@ jobs:
         env:
           TICKETMASTER_API_KEY: ${{ secrets.TICKETMASTER_API_KEY }}
           TICKETWATCH_NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TICKETWATCH_EMAIL_TO: ${{ secrets.ALERT_EMAIL }}
+          TICKETWATCH_SMTP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
           TICKETWATCH_DESKTOP: "0"
         run: |
           set +e

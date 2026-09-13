@@ -72,6 +72,22 @@ class LoadingTests(unittest.TestCase):
         path = self.write({"_comment": "hello", "api_key": "abc"})
         self.assertEqual(build_config(config_path=path, environ={}).api_key, "abc")
 
+    def test_comment_keys_are_allowed_inside_notifiers_too(self):
+        path = self.write({"api_key": "abc", "notifiers": {"_note": "hello", "ntfy_topic": "t"}})
+        self.assertEqual(build_config(config_path=path, environ={}).notifiers.ntfy_topic, "t")
+
+    def test_unknown_notifier_keys_are_rejected(self):
+        path = self.write({"api_key": "abc", "notifiers": {"emails": "typo"}})
+        with self.assertRaises(ConfigError) as ctx:
+            build_config(config_path=path, environ={})
+        self.assertIn("emails", str(ctx.exception))
+
+    def test_the_shipped_example_config_actually_loads(self):
+        example = Path(__file__).resolve().parent.parent / "config.example.json"
+        cfg = build_config(config_path=example, environ={})
+        self.assertEqual(cfg.keyword, "Sienna Spiro")
+        self.assertEqual(cfg.cities, ["Toronto"])
+
     def test_unknown_keys_are_rejected_loudly(self):
         path = self.write({"api_key": "abc", "keywords": "typo"})
         with self.assertRaises(ConfigError) as ctx:
@@ -116,6 +132,16 @@ class LoadingTests(unittest.TestCase):
         self.assertEqual(cfg.cities, ["Toronto", "Hamilton"])
         self.assertFalse(cfg.check_inventory)
         self.assertFalse(cfg.notifiers.desktop)
+
+    def test_email_can_be_configured_entirely_from_the_environment(self):
+        cfg = build_config(environ={
+            "TICKETMASTER_API_KEY": "k",
+            "TICKETWATCH_EMAIL_TO": "someone@gmail.com",
+            "TICKETWATCH_SMTP_PASSWORD": "app-password",
+        })
+        self.assertEqual(cfg.notifiers.smtp_host, "smtp.gmail.com")
+        self.assertEqual(cfg.notifiers.smtp_user, "someone@gmail.com")
+        self.assertTrue(cfg.notifiers.email_ready)
 
     def test_unrelated_env_vars_are_ignored(self):
         overrides = env_overrides({"PATH": "/usr/bin", "HOME": "/root"})

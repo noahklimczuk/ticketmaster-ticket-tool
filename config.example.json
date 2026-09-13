@@ -21,10 +21,14 @@
     "ntfy_topic": null,
     "webhook_url": null,
     "command": null,
+
+    "_email": "Easiest way to fill these in: ticketwatch setup-email you@example.com",
     "email_to": null,
+    "email_from": null,
     "smtp_host": null,
     "smtp_port": 587,
     "smtp_user": null,
-    "smtp_password": null
+    "smtp_password": null,
+    "smtp_starttls": true
   }
 }

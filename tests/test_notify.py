@@ -6,8 +6,8 @@ import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-from tests.support import MockServer, event_payload
-from ticketwatch.alerts import make_alert
+from tests.support import MockServer, MockSMTPServer, event_payload
+from ticketwatch.alerts import error_alert, make_alert
 from ticketwatch.config import NotifierSettings
 from ticketwatch.events import EventSnapshot
 from ticketwatch.notify import (
@@ -17,6 +17,7 @@ from ticketwatch.notify import (
     DesktopNotifier,
     Dispatcher,
     EmailNotifier,
+    email_html,
     NtfyNotifier,
     WebhookNotifier,
     build_dispatcher,
@@ -130,15 +131,199 @@ class WebhookTests(unittest.TestCase):
 
 
 class EmailTests(unittest.TestCase):
-    def test_builds_a_sensible_message(self):
+    def settings(self, **kwargs) -> NotifierSettings:
+        kwargs.setdefault("email_to", "someone@gmail.test")
+        kwargs.setdefault("smtp_host", "smtp.test")
+        return NotifierSettings(**kwargs)
+
+    def send(self, alert_obj=None, **kwargs):
         sent = []
-        settings = NotifierSettings(email_to="me@example.test", email_from="bot@example.test", smtp_host="smtp.test")
-        EmailNotifier(settings, sender=sent.append).send(alert())
-        message = sent[0]
-        self.assertEqual(message["To"], "me@example.test")
+        EmailNotifier(self.settings(**kwargs), sender=sent.append).send(alert_obj or alert())
+        return sent[0]
+
+    def part(self, message, subtype: str) -> str:
+        return message.get_body(preferencelist=(subtype,)).get_content()
+
+    def test_headers(self):
+        message = self.send(email_from="bot@example.test")
+        self.assertEqual(message["To"], "someone@gmail.test")
         self.assertEqual(message["From"], "bot@example.test")
         self.assertIn("TICKETS ON SALE", message["Subject"])
-        self.assertIn("ticketmaster.ca", message.get_content())
+        self.assertTrue(message["Date"])
+        self.assertTrue(message["Message-ID"])
+
+    def test_urgent_subjects_are_marked_for_a_lock_screen(self):
+        self.assertTrue(self.send().get("Subject").startswith("\U0001F39F"))
+        self.assertFalse(self.send(alert("sold_out")).get("Subject").startswith("\U0001F39F"))
+
+    def test_it_is_sent_as_both_plain_text_and_html(self):
+        message = self.send()
+        self.assertEqual(message.get_content_type(), "multipart/alternative")
+        self.assertIn("Buy now: https://www.ticketmaster.ca/event/", self.part(message, "plain"))
+        self.assertIn("<html>", self.part(message, "html"))
+
+    def test_the_html_carries_a_working_buy_button(self):
+        html = self.part(self.send(), "html")
+        self.assertIn('href="https://www.ticketmaster.ca/event/G5vYZ9abc123"', html)
+        self.assertIn("Buy on Ticketmaster", html)
+
+    def test_the_html_shows_the_details_that_matter(self):
+        html = self.part(self.send(), "html")
+        for expected in ("Sienna Spiro", "2026-10-25 19:00", "History, Toronto, ON", "59.50-149.00 CAD",
+                         "says available"):
+            self.assertIn(expected, html)
+
+    def test_the_html_leads_with_the_event_not_a_repeat_of_the_subject(self):
+        html = self.part(self.send(), "html")
+        self.assertEqual(html.count("Sienna Spiro"), 1)
+        self.assertIn("Toronto - 2026-10-25 19:00", html)
+
+    def test_the_status_line_does_not_say_the_same_thing_twice(self):
+        low = alert()
+        low.event.inventory_status = "FEW_TICKETS_LEFT"
+        html = email_html(low)
+        self.assertIn("Few left", html)
+        self.assertNotIn("says few tickets left", html)
+
+    def test_inventory_is_shown_when_it_adds_something(self):
+        self.assertIn("says available", email_html(alert()))
+
+    def test_html_is_escaped(self):
+        nasty = alert()
+        nasty.event.venue = '<script>alert("x")</script>'
+        nasty.event.name = "Tickets & <b>more</b>"
+        html = email_html(nasty)
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertIn("Tickets &amp; &lt;b&gt;more&lt;/b&gt;", html)
+
+    def test_a_title_only_alert_is_escaped_too(self):
+        rude = error_alert("boom")
+        rude.title = "Trouble & <b>strife</b>"
+        self.assertIn("Trouble &amp; &lt;b&gt;strife&lt;/b&gt;", email_html(rude))
+
+    def test_an_alert_without_a_link_still_renders(self):
+        no_link = alert()
+        no_link.url = ""
+        html = email_html(no_link)
+        self.assertNotIn("Buy on Ticketmaster", html)
+        self.assertIn("Sienna Spiro", html)
+
+    def test_an_error_alert_has_no_event_block(self):
+        html = email_html(error_alert("Ticketmaster is down"))
+        self.assertIn("error", html)
+
+
+class EmailDeliveryTests(unittest.TestCase):
+    """Drive the real SMTP path against a local server."""
+
+    def settings(self, server: MockSMTPServer) -> NotifierSettings:
+        settings = NotifierSettings(
+            email_to="noah@example.test",
+            smtp_host=server.host,
+            smtp_port=server.port,
+            smtp_password="app-password",
+            smtp_starttls=False,  # the mock server speaks plain SMTP
+        )
+        settings.apply_email_defaults()
+        return settings
+
+    def test_a_message_really_goes_out(self):
+        with MockSMTPServer() as server:
+            EmailNotifier(self.settings(server)).send(alert())
+            self.assertEqual(len(server.messages), 1)
+            wire = server.messages[0]
+        self.assertIn("To: noah@example.test", wire)
+        self.assertIn("From: noah@example.test", wire)
+        self.assertIn("multipart/alternative", wire)
+        self.assertIn("Buy on Ticketmaster", _decoded(wire))
+
+    def test_it_authenticates(self):
+        with MockSMTPServer() as server:
+            EmailNotifier(self.settings(server)).send(alert())
+            self.assertTrue(server.auth_attempts)
+
+    def test_a_rejected_password_explains_app_passwords(self):
+        with MockSMTPServer(reject_auth=True) as server:
+            # Treat the mock host as one of the providers that demands an app password.
+            with mock.patch("ticketwatch.config.APP_PASSWORD_REQUIRED", {server.host}):
+                with self.assertRaises(Exception) as ctx:
+                    EmailNotifier(self.settings(server)).send(alert())
+        message = str(ctx.exception)
+        self.assertIn("refused the login", message)
+        self.assertIn("app password", message)
+
+    def test_a_rejected_password_is_still_reported_without_the_hint(self):
+        with MockSMTPServer(reject_auth=True) as server:
+            with self.assertRaises(Exception) as ctx:
+                EmailNotifier(self.settings(server)).send(alert())
+        self.assertIn("refused the login", str(ctx.exception))
+
+    def test_the_dispatcher_reports_a_bad_password_without_dying(self):
+        with MockSMTPServer(reject_auth=True) as server:
+            dispatcher = Dispatcher([EmailNotifier(self.settings(server))])
+            self.assertEqual(dispatcher.dispatch([alert()]), 0)
+
+
+def _decoded(wire: str) -> str:
+    """Undo quoted-printable so assertions can read the HTML part."""
+    import quopri
+
+    return quopri.decodestring(wire.encode("utf-8", "replace")).decode("utf-8", "replace")
+
+
+class EmailDefaultsTests(unittest.TestCase):
+    def test_a_gmail_address_is_enough(self):
+        settings = NotifierSettings(email_to="someone@gmail.com")
+        settings.apply_email_defaults()
+        self.assertEqual(settings.smtp_host, "smtp.gmail.com")
+        self.assertEqual(settings.smtp_port, 587)
+        self.assertEqual(settings.smtp_user, "someone@gmail.com")
+        self.assertEqual(settings.email_from, "someone@gmail.com")
+        self.assertTrue(settings.email_ready)
+        self.assertTrue(settings.needs_app_password)
+
+    def test_other_providers(self):
+        for address, host in [
+            ("a@outlook.com", "smtp-mail.outlook.com"),
+            ("a@yahoo.com", "smtp.mail.yahoo.com"),
+            ("a@icloud.com", "smtp.mail.me.com"),
+            ("a@fastmail.com", "smtp.fastmail.com"),
+        ]:
+            settings = NotifierSettings(email_to=address)
+            settings.apply_email_defaults()
+            self.assertEqual(settings.smtp_host, host, address)
+
+    def test_explicit_settings_are_never_overwritten(self):
+        settings = NotifierSettings(email_to="me@gmail.com", smtp_host="smtp.work.test",
+                                    smtp_port=2525, smtp_user="bot", email_from="bot@work.test")
+        settings.apply_email_defaults()
+        self.assertEqual(settings.smtp_host, "smtp.work.test")
+        self.assertEqual(settings.smtp_port, 2525)
+        self.assertEqual(settings.smtp_user, "bot")
+        self.assertEqual(settings.email_from, "bot@work.test")
+
+    def test_an_unknown_domain_needs_a_host_spelled_out(self):
+        settings = NotifierSettings(email_to="me@some-company.test")
+        settings.apply_email_defaults()
+        self.assertIsNone(settings.smtp_host)
+        self.assertFalse(settings.email_ready)
+
+    def test_calling_it_twice_changes_nothing(self):
+        settings = NotifierSettings(email_to="me@gmail.com")
+        settings.apply_email_defaults()
+        first = (settings.smtp_host, settings.smtp_port, settings.smtp_user, settings.email_from)
+        settings.apply_email_defaults()
+        self.assertEqual(first, (settings.smtp_host, settings.smtp_port, settings.smtp_user, settings.email_from))
+
+    def test_no_address_means_no_guessing(self):
+        settings = NotifierSettings()
+        settings.apply_email_defaults()
+        self.assertIsNone(settings.smtp_host)
+        self.assertFalse(settings.email_ready)
+
+    def test_the_dispatcher_picks_up_an_inferred_server(self):
+        self.assertIn("email", build_dispatcher(NotifierSettings(email_to="me@gmail.com")).channel_names)
 
 
 class CommandTests(unittest.TestCase):

@@ -3,19 +3,30 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import logging
+import os
+import stat
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import __version__
 from .alerts import make_alert
-from .config import ALL_ALERTS, Config, ConfigError, build_config, find_default_config
+from .config import (
+    ALL_ALERTS,
+    Config,
+    ConfigError,
+    NotifierSettings,
+    build_config,
+    find_default_config,
+    load_config_file,
+)
 from .events import EventSnapshot, now_utc
 from .matcher import filter_events
 from .monitor import Monitor
-from .notify import build_dispatcher
+from .notify import EmailNotifier, build_dispatcher
 from .state import StateStore
 from .ticketmaster import AuthError, DiscoveryClient, TicketmasterError
 
@@ -41,6 +52,8 @@ SAMPLE_CONFIG = {
         "open_browser": False,
         "ntfy_topic": None,
         "webhook_url": None,
+        "email_to": None,
+        "smtp_password": None,
     },
 }
 
@@ -109,6 +122,21 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("test-notify", parents=[common, notify], help="Send a fake alert through every channel")
     status = sub.add_parser("status", parents=[common], help="Show what the monitor currently remembers")
     status.add_argument("--json", action="store_true", help="Machine readable output")
+
+    setup_email = sub.add_parser(
+        "setup-email",
+        help="Set up email alerts in one go (writes your gitignored config.json)",
+    )
+    setup_email.add_argument("address", nargs="?", help="Where alerts should be sent")
+    setup_email.add_argument("-c", "--config", metavar="PATH", help="Config file to write (default: ./config.json)")
+    setup_email.add_argument("--smtp-host", help="Only needed for providers we cannot work out from the address")
+    setup_email.add_argument("--smtp-port", type=int)
+    setup_email.add_argument("--password", help="App password. Prompted for if omitted; TICKETWATCH_SMTP_PASSWORD works too")
+    setup_email.add_argument("--no-store-password", action="store_true",
+                             help="Keep the password out of the config file and read it from the environment instead")
+    setup_email.add_argument("--no-starttls", dest="starttls", action="store_false", default=True,
+                             help="For local relays (or Proton Bridge) that do not use STARTTLS")
+    setup_email.add_argument("--no-test", action="store_true", help="Skip the test email")
 
     init = sub.add_parser("init", help="Write a starter config.json")
     init.add_argument("path", nargs="?", default="config.json")
@@ -289,18 +317,14 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def cmd_test_notify(args: argparse.Namespace) -> int:
-    cfg = load(args)
-    dispatcher = build_dispatcher(cfg.notifiers)
-    if not dispatcher.notifiers:
-        print("No notification channels are configured.", file=sys.stderr)
-        return EXIT_ERROR
+def sample_alert(keyword: str = "Sienna Spiro", city: str = "Toronto"):
+    """A realistic-looking alert for testing notification channels."""
     sample = EventSnapshot(
         id="TEST",
-        name=f"{cfg.keyword} (test alert)",
+        name=f"{keyword} (test alert)",
         url="https://www.ticketmaster.ca/",
         venue="History",
-        city=cfg.cities[0] if cfg.cities else "Toronto",
+        city=city,
         local_date="2026-10-25",
         local_time="19:00:00",
         status_code="onsale",
@@ -309,7 +333,16 @@ def cmd_test_notify(args: argparse.Namespace) -> int:
         price_max=149.0,
         currency="CAD",
     )
-    alert = make_alert("on_sale", sample, now_utc(), artist=cfg.keyword)
+    return make_alert("on_sale", sample, now_utc(), artist=keyword)
+
+
+def cmd_test_notify(args: argparse.Namespace) -> int:
+    cfg = load(args)
+    dispatcher = build_dispatcher(cfg.notifiers)
+    if not dispatcher.notifiers:
+        print("No notification channels are configured.", file=sys.stderr)
+        return EXIT_ERROR
+    alert = sample_alert(cfg.keyword, cfg.cities[0] if cfg.cities else "Toronto")
     delivered = dispatcher.dispatch([alert])
     print(f"Sent a test alert through: {', '.join(dispatcher.channel_names)} ({delivered} delivery attempt(s) ok)")
     return EXIT_OK
@@ -342,6 +375,112 @@ def cmd_status(args: argparse.Namespace) -> int:
         if record.last_alert_at:
             print(f"  last alert for {event_id}: {record.last_alert_kind} at {record.last_alert_at}")
     return EXIT_OK
+
+
+def cmd_setup_email(args: argparse.Namespace) -> int:
+    """Ask the three things we cannot guess, work out the rest, prove it works."""
+    path = Path(args.config).expanduser() if args.config else (find_default_config() or Path("config.json"))
+    existing = load_config_file(path) if path.is_file() else dict(SAMPLE_CONFIG)
+
+    address = args.address or _prompt("Send ticket alerts to which email address? ")
+    if not address:
+        print("Which address? Pass it as an argument: ticketwatch setup-email you@example.com",
+              file=sys.stderr)
+        return EXIT_ERROR
+    if "@" not in address:
+        print(f"That does not look like an email address: {address}", file=sys.stderr)
+        return EXIT_ERROR
+
+    settings = NotifierSettings(email_to=address, smtp_host=args.smtp_host, smtp_starttls=args.starttls)
+    if args.smtp_port:
+        settings.smtp_port = args.smtp_port
+    settings.apply_email_defaults()
+
+    if not settings.smtp_host:
+        print(f"We do not know the mail server for {address.rpartition('@')[2]}.")
+        settings.smtp_host = args.smtp_host or _prompt("SMTP host (e.g. smtp.example.com): ")
+        if not settings.smtp_host:
+            print("Re-run with --smtp-host (and --smtp-port if it is not 587).", file=sys.stderr)
+            return EXIT_ERROR
+        port = _prompt(f"SMTP port [{settings.smtp_port}]: ")
+        if port.strip():
+            try:
+                settings.smtp_port = int(port)
+            except ValueError:
+                print(f"{port} is not a port number.", file=sys.stderr)
+                return EXIT_ERROR
+
+    print(f"Sending through {settings.smtp_host}:{settings.smtp_port} as {settings.smtp_user}.")
+    if settings.needs_app_password:
+        print("This provider needs an app password, not your normal one.")
+        if "gmail" in settings.smtp_host:
+            print("  Create one at https://myaccount.google.com/apppasswords")
+            print("  (it only appears once 2-Step Verification is on).")
+
+    password = args.password or os.environ.get("TICKETWATCH_SMTP_PASSWORD") or ""
+    if not password:
+        if not sys.stdin.isatty():
+            print(
+                "No password given. Pass --password, or set TICKETWATCH_SMTP_PASSWORD.",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+        password = getpass.getpass("App password (hidden): ")
+    if not password:
+        print("No password, no email.", file=sys.stderr)
+        return EXIT_ERROR
+    if settings.needs_app_password:
+        # Google and friends show app passwords in groups of four; the spaces
+        # are decoration and will fail the login if you keep them.
+        password = password.replace(" ", "")
+    settings.smtp_password = password
+
+    notifiers = dict(existing.get("notifiers") or {})
+    notifiers.update(
+        {
+            "email_to": settings.email_to,
+            "email_from": settings.email_from,
+            "smtp_host": settings.smtp_host,
+            "smtp_port": settings.smtp_port,
+            "smtp_user": settings.smtp_user,
+            "smtp_starttls": settings.smtp_starttls,
+            "smtp_password": None if args.no_store_password else password,
+        }
+    )
+    existing["notifiers"] = notifiers
+    existing.setdefault("api_key", SAMPLE_CONFIG["api_key"])
+
+    path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600 - it holds a password
+    except OSError:  # pragma: no cover - unusual filesystems
+        pass
+    print(f"\nSaved to {path} (gitignored, readable only by you).")
+    if args.no_store_password:
+        print("Password not stored. Export TICKETWATCH_SMTP_PASSWORD before running the watcher.")
+
+    if args.no_test:
+        return EXIT_OK
+
+    print("Sending a test email...")
+    try:
+        EmailNotifier(settings).send(sample_alert())
+    except Exception as exc:  # any SMTP failure, reported plainly
+        print(f"\nCould not send: {exc}", file=sys.stderr)
+        print("Fix the above and re-run `ticketwatch setup-email`.", file=sys.stderr)
+        return EXIT_ERROR
+    print(f"Sent. Check {address} - it should have a 'Buy on Ticketmaster' button.")
+    return EXIT_OK
+
+
+def _prompt(question: str) -> str:
+    """Ask, but never block when there is nobody at the keyboard."""
+    if not sys.stdin.isatty():
+        return ""
+    try:
+        return input(question).strip()
+    except EOFError:
+        return ""
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -386,6 +525,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "check": cmd_check,
         "resolve": cmd_resolve,
         "test-notify": cmd_test_notify,
+        "setup-email": cmd_setup_email,
         "status": cmd_status,
         "init": cmd_init,
     }

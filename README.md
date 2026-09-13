@@ -85,6 +85,7 @@ ticketwatch watch --once          # a single check
 ticketwatch check                 # one check, prints a table
 ticketwatch check --json          # same, machine readable (for cron/scripts)
 ticketwatch resolve               # find the artist's Ticketmaster id and every upcoming date
+ticketwatch setup-email you@x.com # set up email alerts and send a test message
 ticketwatch test-notify           # fire a fake alert through every channel you configured
 ticketwatch status                # what the monitor currently remembers
 ticketwatch init                  # write a starter config.json
@@ -132,7 +133,7 @@ Configure any combination in `config.json` (or with flags / env vars).
 | **Desktop popup** | on by default | macOS Notification Centre, Linux `notify-send`, Windows balloon |
 | **Phone push** | `--ntfy my-secret-topic` | Install the [ntfy](https://ntfy.sh) app, subscribe to the same topic. No account needed — pick a topic nobody will guess |
 | **Slack / Discord** | `--webhook https://hooks.slack.com/...` | Payload shape is detected from the URL; anything else gets full JSON |
-| **Email** | `email_to` + `smtp_*` in config | Use an app password, not your real one |
+| **Email** | `ticketwatch setup-email you@example.com` | HTML mail with a one-tap **Buy on Ticketmaster** button. See below |
 | **Browser** | `--open-browser` | Opens the event page when tickets go buyable |
 | **Your own script** | `--command 'say "tickets"'` | Gets `TICKETWATCH_KIND`, `_TITLE`, `_BODY`, `_URL`, `_EVENT_ID`, `_VENUE`, `_CITY`, `_DATE`, `_JSON` |
 
@@ -142,9 +143,48 @@ Check they work before you rely on them:
 ticketwatch test-notify
 ```
 
+### Email alerts
+
+One command sets it up, sends a test message, and proves it works:
+
+```bash
+ticketwatch setup-email you@example.com
+```
+
+It works out the mail server from your address (Gmail, Outlook, Yahoo, iCloud,
+Fastmail, Proton Bridge), asks for the password without echoing it, and writes
+everything to your **gitignored** `config.json` with `600` permissions. After
+that, `ticketwatch watch` emails you on every alert.
+
+**Gmail needs an app password**, not your normal one:
+
+1. Turn on 2-Step Verification if it is not already on.
+2. Create an app password at <https://myaccount.google.com/apppasswords>.
+3. Paste it when asked — the spaces Google shows are decoration and get stripped.
+
+Prefer to keep the password out of the file? Use the environment instead:
+
+```bash
+ticketwatch setup-email you@example.com --no-store-password
+export TICKETWATCH_SMTP_PASSWORD='your-app-password'
+```
+
+Each alert arrives as an HTML mail whose subject is readable on a lock screen
+(`🎟 TICKETS ON SALE: Sienna Spiro - Toronto - 2026-10-25 19:00`) and whose body
+is a card with the venue, date, price, ticket limit, and a **Buy on Ticketmaster**
+button straight to the event page. A plain-text version rides along for clients
+that do not do HTML.
+
+For an SMTP server we cannot guess:
+
+```bash
+ticketwatch setup-email you@example.com --smtp-host smtp.example.com --smtp-port 587
+```
+
 A belt-and-braces setup for an onsale you really care about:
 
 ```bash
+ticketwatch setup-email you@example.com          # once
 ticketwatch watch -i 20 --ntfy sienna-toronto-8f3k --open-browser --repeat-minutes 5
 ```
 
@@ -245,6 +285,8 @@ Precedence: **defaults → `config.json` → environment → command line flags.
 | `check_inventory` | `true` | Use the inventory-status endpoint as well as sale dates |
 | `strict_artist_match` | `true` | Require the keyword to appear in the event or artist name |
 | `use_api_city_filter` | `false` | Let Ticketmaster filter by city (see below) |
+| `notifiers.email_to` | `null` | Where to email alerts (`setup-email` fills this in) |
+| `notifiers.smtp_*` | inferred | Worked out from the address for the common providers |
 | `state_file` | `"state.json"` | Where "already told you" is remembered |
 | `log_level` / `log_file` | `INFO` / none | Logging |
 
@@ -308,6 +350,14 @@ it should still match; if the artist name differs, use `--attraction-id`.
 enabled for every key; sale windows are used instead. Add `--no-inventory` to skip
 the call entirely.
 
+**Email says "refused the login"** — Gmail, Yahoo and iCloud reject normal
+passwords over SMTP. Create an app password (Gmail:
+<https://myaccount.google.com/apppasswords>, which only appears once 2-Step
+Verification is on) and re-run `ticketwatch setup-email`.
+
+**The email never arrives** — check the spam folder for the first one, then run
+`ticketwatch test-notify` to see the error the server returns.
+
 **Too many notifications** — trim `alert_on`, or set `repeat_alert_minutes` to 0.
 
 **Nothing happens on desktop (Linux)** — install `libnotify-bin` for `notify-send`.
@@ -320,7 +370,7 @@ the call entirely.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-174 tests, no network access and no API key required — a local stand-in HTTP
+210 tests, no network access and no API key required — a local stand-in HTTP
 server answers as Ticketmaster would, including pagination, 401s, 429s and 500s.
 
 ```
