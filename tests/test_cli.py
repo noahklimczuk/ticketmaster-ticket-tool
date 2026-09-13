@@ -61,6 +61,9 @@ class EndToEndTests(unittest.TestCase):
             "state_file": "state.json",
             "discovery_base_url": f"{self.server.base_url}/discovery/v2",
             "inventory_base_url": f"{self.server.base_url}/inventory-status/v1",
+            # No test may reach the real internet.
+            "bandsintown_app_id": "",
+            "seatgeek_client_id": None,
             "notifiers": {"console": False, "desktop": False},
         }
         data.update(extra)
@@ -98,9 +101,10 @@ class EndToEndTests(unittest.TestCase):
         code, out, _ = self.run_cli(["check", "-c", str(self.write_config()), "--json"])
         payload = json.loads(out)
         self.assertEqual(code, cli.EXIT_OK)
-        self.assertEqual(payload["buyable"], ["G5vYZ9abc123"])
-        self.assertEqual(payload["events"][0]["venue"], "History")
+        self.assertEqual(payload["buyable"], ["toronto|2026-10-25"])
+        self.assertEqual(payload["events"][0]["sources"]["ticketmaster"]["venue"], "History")
         self.assertEqual(payload["alerts"][0]["kind"], "new_event")
+        self.assertEqual(payload["platform_errors"], {})
 
     def test_check_says_so_when_there_is_nothing_yet(self):
         self.serve([])
@@ -128,7 +132,7 @@ class EndToEndTests(unittest.TestCase):
         code, _, _ = self.run_cli(["watch", "-c", str(config), "--once"])
         self.assertEqual(code, cli.EXIT_OK)
         state = json.loads((self.dir / "state.json").read_text(encoding="utf-8"))
-        self.assertIn("G5vYZ9abc123", state["events"])
+        self.assertIn("toronto|2026-10-25", state["events"])
 
     def test_watch_alerts_only_once_for_the_same_news(self):
         self.serve([event_payload()])

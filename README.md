@@ -1,366 +1,305 @@
 # ticketwatch
 
-Keeps asking Ticketmaster whether **Sienna Spiro tickets in Toronto** are actually
-buyable, and makes noise the second they are — terminal bell, desktop popup, phone
-push, Slack/Discord, email, or a command of your own.
+Watches **every ticket platform at once** for the shows you want, tells you the
+moment they are buyable, and points at whoever is selling them cheapest.
 
-Zero dependencies. Python 3.9+. One file of config.
+Built for one job: catching Sienna Spiro tickets in Toronto. It works for any
+artist in any city.
 
-```
-$ ticketwatch check
-  BUY NOW Sienna Spiro - 2026-10-25 19:00 - History, Toronto, ON [on_sale] from 59.50-149.00 CAD
-          https://www.ticketmaster.ca/event/G5vYZ9abc123
-```
+- **Control panel** in your browser — start, stop, compare prices, change settings
+- **One .exe** on Windows, no Python install, no terminal
+- **Cheapest price across platforms**, side by side, with a direct buy link
+- **New dates** as soon as *any* platform lists them, not just Ticketmaster
+- Alerts by email, phone push, desktop popup, Slack/Discord, or your own script
 
 ---
 
-## Quick start
+## Get it running
 
-**1. Get a free API key** (takes about two minutes)
+### Windows: just the .exe
 
-Go to <https://developer.ticketmaster.com/>, sign up, and copy the **Consumer Key**
-from your app. The free tier allows 5,000 calls a day, which is plenty — polling
-every 60 seconds uses about 2,880.
+1. Go to the repo's **Actions** tab → **build-exe** → **Run workflow**.
+2. Wait ~2 minutes, download the **ticketwatch-windows** artifact, unzip it.
+3. Double-click `ticketwatch.exe`. The control panel opens in your browser.
+4. Paste a Ticketmaster API key into Settings (free, link below) and press **Start watching**.
 
-**2. Point the tool at it**
+Keep the little black window open — closing it quits the watcher.
+
+> Windows may warn about an unrecognised app: **More info → Run anyway**. The
+> binary is unsigned because code-signing certificates cost money; the workflow
+> that built it is in this repo and runs the full test suite first.
+
+### Mac, Linux, or from source
 
 ```bash
-git clone https://github.com/noahklimczuk/ticketmaster-ticket-tool.git
+git clone -b claude/sienna-spiro-ticket-monitor-nchk75 \
+  https://github.com/noahklimczuk/ticketmaster-ticket-tool.git
 cd ticketmaster-ticket-tool
 export TICKETMASTER_API_KEY="your-consumer-key"
+python3 -m ticketwatch gui
 ```
 
-**3. Watch**
+No dependencies, Python 3.9+. `packaging/build.sh` makes a standalone binary for
+your machine if you want one.
 
-```bash
-python3 -m ticketwatch watch
-```
+### The API key
 
-That's it. It polls every 60 seconds and stays quiet until something changes.
-Leave it running in a terminal tab. `Ctrl-C` stops it.
-
-Optional install so you can type `ticketwatch` anywhere:
-
-```bash
-pip install -e .
-```
+<https://developer.ticketmaster.com/> — sign up, copy the **Consumer Key** (not
+the Secret). Free tier is 5,000 calls/day; polling every 60s uses about 2,900.
 
 ---
 
-## What it actually checks
+## The control panel
 
-For every event it finds, the tool works out whether you could put tickets in a
-cart *right now*, using two signals:
+`ticketwatch gui` (or double-clicking the .exe) opens a page on `127.0.0.1:8765`
+that only your machine can reach:
 
-| Signal | What it tells us |
-| --- | --- |
-| `dates.status.code` + `sales.public` / `sales.presales` windows | Whether the onsale has started, is scheduled, is in presale, or has ended |
-| Ticketmaster's inventory-status endpoint | `AVAILABLE`, `FEW_TICKETS_LEFT`, `SOLD_OUT`, `CANCELLED` |
+- **Available now** banner with the cheapest price and a buy button
+- **Every show found**, each with a price-per-platform table, cheapest first
+- **Platform chips** showing what is set up and what is failing
+- **Alerts** and an activity log, updating every two seconds
+- **Settings** — artist, cities, interval, API keys, email, phone push — saved
+  to a `config.json` that only you can read
 
-When the inventory endpoint answers, it wins — an event can say "onsale" long
-after the last ticket went. If your API key isn't entitled to that endpoint, the
-tool notices once, says so, and falls back to the sale windows.
+Useful flags:
 
-You get told about:
+```bash
+ticketwatch gui --start           # begin watching the moment it opens
+ticketwatch gui --port 9000
+ticketwatch gui --host 0.0.0.0    # reach it from your phone on the same wifi
+ticketwatch gui --no-open         # do not launch a browser
+```
+
+Beyond `127.0.0.1` the panel generates a secret token and puts it in the URL —
+open exactly the link it prints.
+
+---
+
+## Platforms
+
+| Platform | What it gives us | Setup |
+| --- | --- | --- |
+| **Ticketmaster** | Primary inventory, onsale times, presales, real availability, prices | Free API key — **required** |
+| **SeatGeek** | Resale prices and listing counts, often below face value | Optional client ID from [seatgeek.com/account/develop](https://seatgeek.com/account/develop) |
+| **Bandsintown** | New dates, often before they hit Ticketmaster, with a link to whoever sells them | Optional app id (any name you pick). On by default |
+| StubHub, Vivid Seats, Gametime | One-click search links per show | No public API — see below |
+
+**About StubHub and Vivid Seats.** Both gate their APIs behind partner approval,
+and scraping them breaks their terms and loses to their bot protection. So the
+tool does not pretend to price them: every show gets a **search link** for each,
+pre-filled with the artist and city, one click from the alert. If you get partner
+credentials, `ticketwatch/providers/` is built to take another provider — the
+shape is a `fetch()` that returns `Listing` objects.
+
+Each platform is polled independently. One being down, rate-limited, or
+misconfigured never stops the others — the panel shows which one is unhappy.
+
+---
+
+## Cheapest tickets
+
+Listings for the same city and night are merged into one show, wherever they came
+from (a Toronto venue filed under "North York" on one platform still matches).
+Each show then shows every platform's price, cheapest first, and the buy button
+points at the cheapest one.
+
+```
+2026-10-25 19:00    History, Toronto, ON                    ON SALE
+  SeatGeek    137 listings                     88.00 CAD    buy
+  Ticketmaster                                 95.00 CAD    buy
+  Also check: StubHub ↗  Vivid Seats ↗  Gametime ↗
+```
+
+Two honest caveats:
+
+- **Prices exclude fees** unless a platform says otherwise — the `+fees` marker
+  is a reminder, and resale fees can be brutal.
+- **Currencies are not converted.** If one platform quotes USD and another CAD,
+  the tool flags it rather than pretending to compare. No invented exchange rates.
+
+A `cheaper` alert fires when the cheapest price drops by more than
+`price_drop_percent` (5% by default) since the last look.
+
+**On rate limits.** Ticketmaster's free tier allows 5,000 calls a day. Each check
+costs it 2 calls (events plus inventory), so the 60-second default lands around
+2,900/day. Drop to 30s and you will need `--no-inventory` to stay inside it;
+`ticketwatch watch` prints the estimate on startup and warns you. The other
+platforms are polled once per check and back off on their own 429s.
+
+---
+
+## New dates
+
+`new_event` fires the first time a show appears on *any* platform — including a
+date Ticketmaster has not listed yet, which is where Bandsintown earns its place.
+It is on by default. Alerts fire once per change, so you get told when something
+happens and left alone when it does not.
 
 | Alert | Fires when |
 | --- | --- |
-| `new_event` | A Toronto date appears that wasn't there before |
-| `on_sale` | The public onsale opens (including the moment a scheduled onsale time simply arrives) |
+| `new_event` | A date appears that we have never seen, on any platform |
+| `on_sale` | The public onsale opens, including a scheduled time simply arriving |
 | `presale` | A presale window opens |
-| `back_in_stock` | Sold out → available again (returns and released holds) |
+| `back_in_stock` | Sold out → available again |
 | `low_inventory` | Ticketmaster starts reporting "few tickets left" |
-| `sold_out`, `status_change`, `price_change`, `gone` | Off by default — add them to `alert_on` if you want them |
-
-Each alert fires **once** per change. State lives in `state.json`; delete it to
-start over.
+| `cheaper` | The cheapest price drops meaningfully |
+| `new_platform` | The show appears on a platform it was not on before (off by default) |
+| `sold_out`, `status_change`, `price_change`, `gone` | Off by default |
 
 ---
 
-## Commands
+## Command line
+
+Everything the panel does is also a command:
 
 ```bash
-ticketwatch watch                 # poll forever (the default; bare `ticketwatch` does this too)
+ticketwatch gui                   # the control panel (the .exe default)
+ticketwatch watch                 # poll forever in the terminal
 ticketwatch watch --once          # a single check
-ticketwatch check                 # one check, prints a table
-ticketwatch check --json          # same, machine readable (for cron/scripts)
-ticketwatch resolve               # find the artist's Ticketmaster id and every upcoming date
-ticketwatch setup-email you@x.com # set up email alerts and send a test message
-ticketwatch test-notify           # fire a fake alert through every channel you configured
+ticketwatch check                 # one check, prints a table; exit 0 if buyable
+ticketwatch check --json          # machine readable, for scripts and cron
+ticketwatch resolve               # find the artist's Ticketmaster id and all dates
+ticketwatch setup-email you@x.com # set up email alerts and send a test
+ticketwatch test-notify           # fire a fake alert through every channel
 ticketwatch status                # what the monitor currently remembers
 ticketwatch init                  # write a starter config.json
 ```
 
-`check` exits **0** if something is buyable, **1** if not, **2** on error — handy in
-a shell loop or a cron job.
-
-### Useful flags
-
 ```bash
-ticketwatch watch -i 30                       # poll every 30 seconds
-ticketwatch watch --city Toronto --city Hamilton
-ticketwatch watch -k "Sienna Spiro"           # any artist
-ticketwatch watch --repeat-minutes 10         # keep nagging while tickets are available
-ticketwatch watch --open-browser              # pop the Ticketmaster page open on an onsale
-ticketwatch watch --alert-on on_sale,back_in_stock,sold_out
+ticketwatch watch -i 30 --seatgeek-id YOUR_ID --open-browser --repeat-minutes 10
+ticketwatch watch --city Toronto --city Hamilton -k "Sienna Spiro"
+ticketwatch watch --alert-on on_sale,cheaper,new_event
 ```
-
-### Pin it to the exact artist
-
-Keyword search can drift (tribute acts, support slots). Lock onto the real artist id:
-
-```bash
-$ ticketwatch resolve
-Matching artists (use the id with --attraction-id for an exact watch):
-  K8vZ917qxR7      Sienna Spiro
-                   https://www.ticketmaster.ca/sienna-spiro-tickets/artist/3376314
-...
-$ ticketwatch watch --attraction-id K8vZ917qxR7
-```
-
-`resolve` also prints every upcoming date it can see, so it's the fastest way to
-confirm the Toronto show exists before you start watching.
 
 ---
 
 ## Getting alerted
 
-Configure any combination in `config.json` (or with flags / env vars).
-
 | Channel | How | Notes |
 | --- | --- | --- |
-| **Terminal** | on by default | Colour + a bell on urgent alerts |
-| **Desktop popup** | on by default | macOS Notification Centre, Linux `notify-send`, Windows balloon |
-| **Phone push** | `--ntfy my-secret-topic` | Install the [ntfy](https://ntfy.sh) app, subscribe to the same topic. No account needed — pick a topic nobody will guess |
-| **Slack / Discord** | `--webhook https://hooks.slack.com/...` | Payload shape is detected from the URL; anything else gets full JSON |
-| **Email** | `ticketwatch setup-email you@example.com` | HTML mail with a one-tap **Buy on Ticketmaster** button. See below |
-| **Browser** | `--open-browser` | Opens the event page when tickets go buyable |
-| **Your own script** | `--command 'say "tickets"'` | Gets `TICKETWATCH_KIND`, `_TITLE`, `_BODY`, `_URL`, `_EVENT_ID`, `_VENUE`, `_CITY`, `_DATE`, `_JSON` |
+| **Panel** | always | Live list, alert feed, activity log |
+| **Terminal** | on by default | Colour, and a bell on urgent alerts |
+| **Desktop popup** | on by default | macOS, Linux (`notify-send`), Windows |
+| **Email** | `ticketwatch setup-email you@example.com` | HTML mail with a one-tap **Buy** button |
+| **Phone push** | `--ntfy my-secret-topic` | Install [ntfy](https://ntfy.sh), subscribe to the topic |
+| **Slack / Discord** | `--webhook https://...` | Payload shape detected from the URL |
+| **Browser** | `--open-browser` | Opens the cheapest seller when tickets go live |
+| **Your own script** | `--command 'say tickets'` | Gets `TICKETWATCH_*` environment variables |
 
-Check they work before you rely on them:
-
-```bash
-ticketwatch test-notify
-```
-
-### Email alerts
-
-One command sets it up, sends a test message, and proves it works:
+### Email
 
 ```bash
 ticketwatch setup-email you@example.com
 ```
 
-It works out the mail server from your address (Gmail, Outlook, Yahoo, iCloud,
-Fastmail, Proton Bridge), asks for the password without echoing it, and writes
-everything to your **gitignored** `config.json` with `600` permissions. After
-that, `ticketwatch watch` emails you on every alert.
+Works out the mail server from your address (Gmail, Outlook, Yahoo, iCloud,
+Fastmail, Proton Bridge), asks for the password without echoing it, saves to your
+gitignored `config.json` at `600`, and sends a test message.
 
-**Gmail needs an app password**, not your normal one:
-
-1. Turn on 2-Step Verification if it is not already on.
-2. Create an app password at <https://myaccount.google.com/apppasswords>.
-3. Paste it when asked — the spaces Google shows are decoration and get stripped.
-
-Prefer to keep the password out of the file? Use the environment instead:
-
-```bash
-ticketwatch setup-email you@example.com --no-store-password
-export TICKETWATCH_SMTP_PASSWORD='your-app-password'
-```
-
-Each alert arrives as an HTML mail whose subject is readable on a lock screen
-(`🎟 TICKETS ON SALE: Sienna Spiro - Toronto - 2026-10-25 19:00`) and whose body
-is a card with the venue, date, price, ticket limit, and a **Buy on Ticketmaster**
-button straight to the event page. A plain-text version rides along for clients
-that do not do HTML.
-
-For an SMTP server we cannot guess:
-
-```bash
-ticketwatch setup-email you@example.com --smtp-host smtp.example.com --smtp-port 587
-```
-
-A belt-and-braces setup for an onsale you really care about:
-
-```bash
-ticketwatch setup-email you@example.com          # once
-ticketwatch watch -i 20 --ntfy sienna-toronto-8f3k --open-browser --repeat-minutes 5
-```
+**Gmail needs an app password**: turn on 2-Step Verification, create one at
+<https://myaccount.google.com/apppasswords>, paste it (the spaces get stripped).
+Prefer to keep it out of the file? `--no-store-password` and export
+`TICKETWATCH_SMTP_PASSWORD` instead.
 
 ---
 
 ## Keeping it running
 
-### macOS (survives logout, restarts itself)
+The panel only watches while it is open. For something that survives a reboot:
 
-Save as `~/Library/LaunchAgents/com.ticketwatch.plist`, editing the paths:
+**Windows** — put a shortcut to `ticketwatch.exe` in
+`shell:startup` (Win+R → `shell:startup`).
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.ticketwatch</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/bin/python3</string>
-    <string>-m</string><string>ticketwatch</string>
-    <string>watch</string>
-    <string>-c</string><string>/Users/you/ticketmaster-ticket-tool/config.json</string>
-  </array>
-  <key>WorkingDirectory</key><string>/Users/you/ticketmaster-ticket-tool</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/ticketwatch.log</string>
-  <key>StandardErrorPath</key><string>/tmp/ticketwatch.log</string>
-</dict>
-</plist>
-```
-
-```bash
-launchctl load ~/Library/LaunchAgents/com.ticketwatch.plist
-```
-
-### Linux (systemd user service)
-
-`~/.config/systemd/user/ticketwatch.service`:
+**Linux** — `~/.config/systemd/user/ticketwatch.service`:
 
 ```ini
 [Unit]
-Description=Ticketmaster ticket watcher
+Description=Ticket watcher
 After=network-online.target
-
 [Service]
 WorkingDirectory=%h/ticketmaster-ticket-tool
 ExecStart=/usr/bin/python3 -m ticketwatch watch -c %h/ticketmaster-ticket-tool/config.json
 Restart=always
 RestartSec=30
-
 [Install]
 WantedBy=default.target
 ```
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user enable --now ticketwatch
-journalctl --user -u ticketwatch -f
+systemctl --user daemon-reload && systemctl --user enable --now ticketwatch
 ```
 
-### Cron (one check every five minutes)
+**macOS** — a launchd agent at `~/Library/LaunchAgents/com.ticketwatch.plist`
+running `/usr/bin/python3 -m ticketwatch watch -c /path/to/config.json` with
+`RunAtLoad` and `KeepAlive` set, then `launchctl load` it. Or simply run
+`ticketwatch watch` inside `tmux` / `screen`.
 
-```cron
-*/5 * * * * cd ~/ticketmaster-ticket-tool && /usr/bin/python3 -m ticketwatch check >> ~/ticketwatch.log 2>&1
-```
-
-### GitHub Actions (no machine left on)
-
-`.github/workflows/ticket-check.yml` is ready to go — add `TICKETMASTER_API_KEY`
-and `NTFY_TOPIC` as repository secrets and enable Actions. GitHub's scheduler is
-best effort and won't beat five-minute granularity, so treat it as a backstop
-rather than your onsale strategy.
+**No machine left on** — `.github/workflows/ticket-check.yml` polls from GitHub
+every five minutes. Add `TICKETMASTER_API_KEY` plus `ALERT_EMAIL` +
+`SMTP_APP_PASSWORD` (or `NTFY_TOPIC`) as repository secrets. GitHub's scheduler
+is best effort, so treat it as a backstop rather than your onsale plan.
 
 ---
 
 ## Configuration
 
-```bash
-ticketwatch init          # writes config.json
-```
+`config.json` next to the tool, or `--config path`. The panel writes it for you.
+It is gitignored, because it holds your keys.
 
-Precedence: **defaults → `config.json` → environment → command line flags.**
-`config.json` is gitignored, because it holds your key.
+Precedence: **defaults → config.json → environment → command line flags.**
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `api_key` | — | Ticketmaster consumer key (or `TICKETMASTER_API_KEY`) |
-| `keyword` | `"Sienna Spiro"` | Artist to search for |
-| `cities` | `["Toronto"]` | Cities to keep; `[]` means anywhere |
-| `country_code` | `"CA"` | ISO country filter |
-| `attraction_id` | `null` | Exact artist id — beats keyword matching |
-| `interval_seconds` | `60` | Seconds between polls |
-| `jitter` | `0.15` | Randomises the interval by ±15% |
-| `alert_on` | the five buyable kinds | Which changes are worth a notification |
-| `repeat_alert_minutes` | `0` | Re-alert this often while tickets stay available (0 = once only) |
-| `check_inventory` | `true` | Use the inventory-status endpoint as well as sale dates |
-| `strict_artist_match` | `true` | Require the keyword to appear in the event or artist name |
-| `use_api_city_filter` | `false` | Let Ticketmaster filter by city (see below) |
-| `notifiers.email_to` | `null` | Where to email alerts (`setup-email` fills this in) |
-| `notifiers.smtp_*` | inferred | Worked out from the address for the common providers |
+| `seatgeek_client_id` | `null` | Turns on SeatGeek price comparison |
+| `seatgeek_currency` | `"USD"` | What SeatGeek prices are quoted in |
+| `bandsintown_app_id` | `"ticketwatch"` | Any name; empty string switches it off |
+| `keyword` | `"Sienna Spiro"` | Artist to watch |
+| `cities` | `["Toronto"]` | `[]` means anywhere |
+| `country_code` | `"CA"` | Matches both `CA` and `Canada` |
+| `interval_seconds` | `60` | Seconds between checks |
+| `price_drop_percent` | `5.0` | How far a price must fall to be worth an alert |
+| `alert_on` | the six buyable kinds | Which changes are worth a notification |
+| `repeat_alert_minutes` | `0` | Re-alert while tickets stay available |
+| `attraction_id` | `null` | Exact Ticketmaster artist id — beats keyword matching |
 | `state_file` | `"state.json"` | Where "already told you" is remembered |
-| `log_level` / `log_file` | `INFO` / none | Logging |
 
-Every key also works as an environment variable: `TICKETWATCH_INTERVAL_SECONDS=30`,
-`TICKETWATCH_NTFY_TOPIC=my-topic`, and so on.
-
-**Why city filtering happens locally.** Ticketmaster's own `city=Toronto` filter
-drops shows at Toronto venues whose record says North York, Scarborough or
-Etobicoke. So the tool asks the API for the artist only, then filters here, where
-those count as Toronto. Set `use_api_city_filter: true` if you'd rather have the
-API do it.
+Every key works as an environment variable too: `TICKETWATCH_INTERVAL_SECONDS=30`,
+`TICKETWATCH_SEATGEEK_CLIENT_ID=...`, `TICKETWATCH_EMAIL_TO=...`.
 
 ---
 
-## Rate limits and being a good citizen
+## What it will not do
 
-The free tier is 5,000 calls/day and 5 calls/second. Each poll is 1 call, plus 1
-more if the inventory check is on.
-
-| Interval | Calls/day | Fits the free tier? |
-| --- | --- | --- |
-| 60s | ~2,880 | yes |
-| 30s | ~5,760 | no — use `--no-inventory` (~2,880) |
-| 20s | ~8,640 | no |
-
-`ticketwatch watch` prints its own estimate on startup and warns you if the
-interval would blow the quota. On HTTP 429 it honours `Retry-After` and backs off;
-on server errors it backs off exponentially up to ten minutes.
-
----
-
-## What this does not do
-
-- **It cannot buy tickets for you.** No cart automation, no checkout, no queue
-  bots. It watches and tells you; the buying is yours.
-- **It doesn't scrape ticketmaster.com.** Everything goes through the official
-  Discovery API with your key, which is why it stays working and doesn't trip
-  bot protection.
-- **It doesn't cover resale** (StubHub, Vivid, SeatGeek). Ticketmaster's own
-  resale inventory shows up in the inventory status; other marketplaces don't.
-- **It won't beat a fast onsale on its own.** A 60-second poll tells you within a
-  minute. For a sale with a known start time, be on the page beforehand — use the
-  countdown that `check` prints.
+- **It cannot buy tickets.** No cart automation, no checkout, no queue bots. It
+  watches and tells you; the clicking is yours.
+- **It does not scrape.** Everything comes from official, key-authenticated APIs,
+  which is why it keeps working and does not trip bot protection.
+- **It does not convert currencies** or guess at fees.
+- **It will not beat a fast onsale by itself.** A 60-second poll tells you inside
+  a minute. For a known onsale time, be on the page early — `check` prints the
+  countdown.
 
 ---
 
 ## Troubleshooting
 
-**"No Ticketmaster API key"** — set `TICKETMASTER_API_KEY` or put `api_key` in
-`config.json`.
+**"No ticket platform is configured"** — add your Ticketmaster key in the panel's
+Settings, or `export TICKETMASTER_API_KEY=...`.
 
-**"Ticketmaster rejected the API key (401)"** — you're probably using the Consumer
-*Secret*. Use the Consumer **Key**. Newly created keys can take a few minutes to
-activate.
+**"Ticketmaster rejected the API key (401)"** — that is usually the Consumer
+*Secret*. Use the Consumer **Key**. New keys take a few minutes to activate.
 
-**No events found** — run `ticketwatch resolve --all-cities` to see everything
-Ticketmaster has for that artist. If the Toronto date is filed under a borough,
-it should still match; if the artist name differs, use `--attraction-id`.
+**A platform chip is red** — hover it for the reason. The other platforms carry
+on regardless; clear `bandsintown_app_id` if you want to stop asking it.
 
-**"Inventory status unavailable for this API key"** — harmless. That endpoint isn't
-enabled for every key; sale windows are used instead. Add `--no-inventory` to skip
-the call entirely.
+**No shows found** — `ticketwatch resolve --all-cities` lists everything
+Ticketmaster has for that artist. Pin it exactly with `--attraction-id`.
 
 **Email says "refused the login"** — Gmail, Yahoo and iCloud reject normal
-passwords over SMTP. Create an app password (Gmail:
-<https://myaccount.google.com/apppasswords>, which only appears once 2-Step
-Verification is on) and re-run `ticketwatch setup-email`.
+passwords over SMTP. Use an app password.
 
-**The email never arrives** — check the spam folder for the first one, then run
-`ticketwatch test-notify` to see the error the server returns.
-
-**Too many notifications** — trim `alert_on`, or set `repeat_alert_minutes` to 0.
-
-**Nothing happens on desktop (Linux)** — install `libnotify-bin` for `notify-send`.
+**Windows SmartScreen blocks the .exe** — More info → Run anyway. It is unsigned.
 
 ---
 
@@ -370,19 +309,22 @@ Verification is on) and re-run `ticketwatch setup-email`.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-210 tests, no network access and no API key required — a local stand-in HTTP
-server answers as Ticketmaster would, including pagination, 401s, 429s and 500s.
+303 tests, no network and no API keys required: local stand-in servers answer as
+Ticketmaster, SeatGeek, Bandsintown and an SMTP server would, including
+pagination, 401s, 429s, 500s and rejected mail logins.
 
 ```
 ticketwatch/
-  ticketmaster.py   Discovery API client (urllib, retries, key redaction)
-  events.py         Event payload -> snapshot, and the availability rules
-  matcher.py        Artist and city matching, including Toronto's boroughs
-  alerts.py         Change detection between polls
-  state.py          Atomic JSON state file
-  notify.py         Console, desktop, ntfy, webhook, email, command, browser
-  monitor.py        The poll loop, backoff, and failure handling
-  cli.py            Argument parsing and the subcommands
+  providers/        One module per platform, all behind one small interface
+  aggregate.py      Merges platforms into one show, works out the cheapest
+  events.py         Ticketmaster payload -> snapshot, availability rules
+  matcher.py        Artist, city and country matching across platforms
+  alerts.py         What changed since last time, and is it worth saying
+  monitor.py        The poll loop, backoff, partial-failure handling
+  notify.py         Console, desktop, email, ntfy, webhook, command, browser
+  gui.py + webui.py The control panel and its JSON API
+  cli.py            Subcommands
+packaging/          PyInstaller spec and build scripts for the executable
 ```
 
 MIT licensed.

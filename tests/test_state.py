@@ -6,16 +6,16 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tests.support import event_payload
+from tests.support import listing, merged
 from ticketwatch.alerts import EventRecord, make_alert
-from ticketwatch.events import EventSnapshot
 from ticketwatch.state import StateStore
 
 NOW = datetime(2026, 5, 1, tzinfo=timezone.utc)
 
 
-def snap(**kwargs) -> EventSnapshot:
-    return EventSnapshot.from_api(event_payload(**kwargs))
+def snap(**kwargs):
+    """A merged event, which is what the store actually holds."""
+    return merged(listing(**kwargs))
 
 
 class StateStoreTests(unittest.TestCase):
@@ -46,6 +46,15 @@ class StateStoreTests(unittest.TestCase):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("{not json at all", encoding="utf-8")
         self.assertEqual(self.store.load(), {})
+
+    def test_every_platform_survives_the_round_trip(self):
+        event = merged(listing(platform="ticketmaster", price_min=120.0),
+                       listing(platform="seatgeek", price_min=88.0))
+        self.store.save(self.store.merge({}, [event], [], timestamp=NOW.isoformat()))
+        restored = self.store.load()[event.id].snapshot
+        self.assertEqual(restored.platforms, ["seatgeek", "ticketmaster"])
+        self.assertEqual(restored.price_min, 88.0)
+        self.assertEqual(restored.cheapest.platform, "seatgeek")
 
     def test_file_from_a_future_version_is_ignored(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,10 +96,10 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(records[event.id].last_alert_at, "2026-04-01T00:00:00+00:00")
 
     def test_merge_drops_events_that_disappeared(self):
-        gone, still_here = snap(event_id="GONE"), snap(event_id="HERE")
+        gone, still_here = snap(local_date="2026-10-25"), snap(local_date="2026-11-02")
         previous = self.store.merge({}, [gone, still_here], [], timestamp=NOW.isoformat())
         records = self.store.merge(previous, [still_here], [], timestamp=NOW.isoformat())
-        self.assertEqual(list(records), ["HERE"])
+        self.assertEqual(list(records), [still_here.id])
 
 
 if __name__ == "__main__":

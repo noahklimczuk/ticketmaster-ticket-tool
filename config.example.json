@@ -1,19 +1,29 @@
 {
   "_comment": "Copy to config.json and add your key. config.json is gitignored.",
   "api_key": "YOUR-TICKETMASTER-CONSUMER-KEY",
-
+  "_platforms": "Optional extras: SeatGeek adds price comparison, Bandsintown finds new dates early.",
+  "seatgeek_client_id": null,
+  "seatgeek_currency": "USD",
+  "bandsintown_app_id": "ticketwatch",
   "keyword": "Sienna Spiro",
-  "cities": ["Toronto"],
+  "cities": [
+    "Toronto"
+  ],
   "country_code": "CA",
   "attraction_id": null,
-
   "interval_seconds": 60,
   "repeat_alert_minutes": 0,
-  "alert_on": ["new_event", "on_sale", "presale", "back_in_stock", "low_inventory"],
-
+  "price_drop_percent": 5.0,
+  "alert_on": [
+    "new_event",
+    "on_sale",
+    "presale",
+    "back_in_stock",
+    "low_inventory",
+    "cheaper"
+  ],
   "state_file": "state.json",
   "log_level": "INFO",
-
   "notifiers": {
     "console": true,
     "desktop": true,
@@ -21,7 +31,6 @@
     "ntfy_topic": null,
     "webhook_url": null,
     "command": null,
-
     "_email": "Easiest way to fill these in: ticketwatch setup-email you@example.com",
     "email_to": null,
     "email_from": null,

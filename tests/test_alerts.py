@@ -143,6 +143,18 @@ class DetectTests(unittest.TestCase):
         )[0]
         self.assertEqual(on_sale.title, "TICKETS ON SALE: Sienna Spiro - Toronto - 2026-10-25 19:00")
 
+    def test_the_body_compares_platforms_and_warns_about_currencies(self):
+        from tests.support import listing, merged
+
+        event = merged(listing(platform="ticketmaster", price_min=120.0, currency="CAD"),
+                       listing(platform="seatgeek", price_min=95.0, currency="USD"))
+        body = detect_changes({}, [event], now=DURING_SALE, artist="Sienna Spiro")[0].body
+        self.assertIn("Cheapest: 95.00 USD on SeatGeek", body)
+        self.assertIn("seatgeek: 95.00 USD", body)
+        self.assertIn("ticketmaster: 120.00 CAD", body)
+        self.assertIn("different currencies", body)
+        self.assertIn("Listed on: seatgeek, ticketmaster", body)
+
     def test_error_alert_shape(self):
         alert = alerts.error_alert("boom")
         self.assertEqual(alert.kind, alerts.ERROR)

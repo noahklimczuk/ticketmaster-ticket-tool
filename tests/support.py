@@ -161,6 +161,81 @@ def events_response(events: List[Dict[str, Any]], page: int = 0, total_pages: in
 
 
 # --------------------------------------------------------------------------- #
+# platform-neutral builders
+# --------------------------------------------------------------------------- #
+def listing(
+    platform: str = "ticketmaster",
+    event_id: str = "G5vYZ9abc123",
+    artist: str = "Sienna Spiro",
+    city: str = "Toronto",
+    venue: str = "History",
+    local_date: str = "2026-10-25",
+    local_time: str = "19:00:00",
+    price_min=59.5,
+    price_max=149.0,
+    currency: str = "CAD",
+    availability: str = "on_sale",
+    **extra: Any,
+):
+    """A Listing with believable defaults."""
+    from ticketwatch.providers.base import Listing
+
+    fields = dict(
+        platform=platform,
+        event_id=event_id,
+        title=artist,
+        artist=artist,
+        venue=venue,
+        city=city,
+        region="ON",
+        country="CA",
+        local_date=local_date,
+        local_time=local_time,
+        url=f"https://{platform}.test/event/{event_id}",
+        price_min=price_min,
+        price_max=price_max,
+        currency=currency,
+        availability=availability,
+    )
+    fields.update(extra)
+    return Listing(**fields)
+
+
+def merged(*listings):
+    """A MergedEvent built from one or more listings."""
+    from ticketwatch.aggregate import MergedEvent
+
+    return MergedEvent.from_listings(list(listings) or [listing()])
+
+
+class FakeProvider:
+    """A platform that returns whatever the test tells it to."""
+
+    label = "Fake"
+    credential_hint = ""
+    reports_prices = True
+
+    def __init__(self, listings=None, error=None, name: str = "fake") -> None:
+        self.name = name
+        self.listings = list(listings or [])
+        self.error = error
+        self.calls = 0
+        self.last_query = None
+
+    def fetch(self, query):
+        self.calls += 1
+        self.last_query = query
+        if self.error:
+            raise self.error
+        return list(self.listings)
+
+    def collect(self, query):
+        from ticketwatch.providers.base import Provider
+
+        return Provider.collect(self, query)
+
+
+# --------------------------------------------------------------------------- #
 # a minimal SMTP server, so the real sending path is exercised too
 # --------------------------------------------------------------------------- #
 class _SMTPHandler(socketserver.StreamRequestHandler):

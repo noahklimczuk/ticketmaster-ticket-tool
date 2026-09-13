@@ -7,20 +7,22 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Sequence
+from typing import Any, Dict, Iterable, Optional, Sequence
 
+from .aggregate import MergedEvent
 from .alerts import Alert, EventRecord
-from .events import EventSnapshot, now_utc
+from .events import now_utc
 
 LOG = logging.getLogger(__name__)
-STATE_VERSION = 1
+STATE_VERSION = 2
 
 
 class StateStore:
     """A tiny JSON document on disk: event id -> what we knew about it."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, decode=MergedEvent.from_dict) -> None:
         self.path = Path(path)
+        self.decode = decode
 
     # ------------------------------------------------------------------ #
     def load(self) -> Dict[str, EventRecord]:
@@ -43,7 +45,7 @@ class StateStore:
             if not isinstance(snapshot_data, dict):
                 continue
             try:
-                snapshot = EventSnapshot.from_dict(snapshot_data)
+                snapshot = self.decode(snapshot_data)
             except (TypeError, ValueError) as exc:
                 LOG.debug("Skipping unreadable state entry %s: %s", event_id, exc)
                 continue
@@ -95,7 +97,7 @@ class StateStore:
     def merge(
         self,
         previous: Dict[str, EventRecord],
-        current: Sequence[EventSnapshot],
+        current: Sequence[Any],
         alerts: Iterable[Alert],
         timestamp: Optional[str] = None,
     ) -> Dict[str, EventRecord]:

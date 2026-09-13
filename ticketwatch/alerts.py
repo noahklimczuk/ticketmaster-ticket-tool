@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .events import EventSnapshot, human_delta, now_utc, parse_iso
 from .matcher import normalize
@@ -19,9 +19,11 @@ SOLD_OUT = "sold_out"
 STATUS_CHANGE = "status_change"
 PRICE_CHANGE = "price_change"
 GONE = "gone"
+CHEAPER = "cheaper"
+NEW_PLATFORM = "new_platform"
 ERROR = "error"
 
-URGENT_KINDS = {NEW_EVENT, ON_SALE, PRESALE, BACK_IN_STOCK, LOW_INVENTORY}
+URGENT_KINDS = {NEW_EVENT, ON_SALE, PRESALE, BACK_IN_STOCK, LOW_INVENTORY, CHEAPER}
 
 # Availability labels meaning the tickets were previously out of reach, so a move
 # to on-sale is a restock rather than a first onsale.
@@ -37,6 +39,8 @@ _HEADLINES = {
     STATUS_CHANGE: "Status changed",
     PRICE_CHANGE: "Price changed",
     GONE: "Event disappeared from results",
+    CHEAPER: "Price dropped",
+    NEW_PLATFORM: "Now listed somewhere new",
     ERROR: "Ticket monitor problem",
 }
 
@@ -46,7 +50,7 @@ class Alert:
     kind: str
     title: str
     body: str
-    event: Optional[EventSnapshot] = None
+    event: Optional[Any] = None
     urgent: bool = False
     repeat: bool = False
     url: str = ""
@@ -62,14 +66,14 @@ class Alert:
 class EventRecord:
     """What we remembered about an event from the previous poll."""
 
-    snapshot: EventSnapshot
+    snapshot: Any
     first_seen: str = ""
     last_seen: str = ""
     last_alert_at: Optional[str] = None
     last_alert_kind: Optional[str] = None
 
 
-def _headline(kind: str, event: Optional[EventSnapshot], artist: str = "") -> str:
+def _headline(kind: str, event, artist: str = "") -> str:
     if kind == NEW_EVENT and artist:
         base = f"New {artist} date found"
     else:
@@ -82,7 +86,7 @@ def _headline(kind: str, event: Optional[EventSnapshot], artist: str = "") -> st
     return f"{base}: {details}" if details else base
 
 
-def _body(event: EventSnapshot, now: datetime) -> str:
+def _body(event, now: datetime) -> str:
     lines = [
         f"{event.name}",
         f"{event.when} - {event.where}",
@@ -90,19 +94,30 @@ def _body(event: EventSnapshot, now: datetime) -> str:
         + (f" (Ticketmaster: {event.inventory_status})" if event.inventory_status else ""),
     ]
     if event.price_range:
-        lines.append(f"Price range: {event.price_range}")
+        lines.append(f"Cheapest: {event.price_range}")
+
+    # One line per platform, cheapest first, so the comparison is right there.
+    quotes = getattr(event, "quotes", [])
+    if len(quotes) > 1:
+        for listing in quotes:
+            lines.append(f"  {listing.platform}: {listing.price_label()}")
+    if getattr(event, "mixed_currency", False):
+        lines.append("  (prices are in different currencies - compare carefully)")
+    platforms = getattr(event, "platforms", [])
+    if platforms:
+        lines.append(f"Listed on: {', '.join(platforms)}")
+
     if event.ticket_limit:
         lines.append(f"Ticket limit: {event.ticket_limit}")
     upcoming = event.next_sale_start(now)
     if upcoming and not event.buyable(now):
         lines.append(f"Sale starts {upcoming.strftime('%Y-%m-%d %H:%M UTC')} ({human_delta(upcoming - now)})")
-    presale = event.active_presale(now)
-    if presale:
-        lines.append(f"Presale running: {presale.name}")
+    if event.presale_label:
+        lines.append(f"Presale running: {event.presale_label}")
     return "\n".join(lines)
 
 
-def make_alert(kind: str, event: Optional[EventSnapshot], now: datetime, artist: str = "", repeat: bool = False) -> Alert:
+def make_alert(kind: str, event, now: datetime, artist: str = "", repeat: bool = False) -> Alert:
     body = _body(event, now) if event else ""
     title = _headline(kind, event, artist)
     if repeat:
@@ -144,6 +159,7 @@ def detect_changes(
     enabled: Optional[Iterable[str]] = None,
     repeat_minutes: int = 0,
     artist: str = "",
+    price_drop_percent: float = 5.0,
 ) -> List[Alert]:
     """Compare this poll against the last one and produce alerts.
 
@@ -168,8 +184,28 @@ def detect_changes(
         after = event.availability(now)
         kind = _transition_kind(before, after, event, now)
 
-        if kind:
+        # Only consume the event for an alert the user actually wants; an
+        # unwanted kind must not mask a price drop in the same round.
+        if kind and _wanted(enabled_set, kind):
             alerts.append(make_alert(kind, event, now, artist))
+            continue
+
+        cheaper = _price_drop(record.snapshot, event, price_drop_percent)
+        # A drop is also a price change; if the user only asked for the generic
+        # kind, report it as that rather than swallowing it entirely.
+        drop_kind = _first_wanted(enabled_set, CHEAPER, PRICE_CHANGE)
+        if cheaper and drop_kind:
+            alert = make_alert(drop_kind, event, now, artist)
+            alert.body = f"Now {cheaper} cheaper than when we last looked.\n\n" + alert.body
+            alerts.append(alert)
+            continue
+
+        fresh = _new_platforms(record.snapshot, event)
+        if fresh and _wanted(enabled_set, NEW_PLATFORM):
+            alert = make_alert(NEW_PLATFORM, event, now, artist)
+            alert.body = f"Newly listed on: {', '.join(fresh)}\n\n" + alert.body
+            alert.urgent = event.buyable(now)
+            alerts.append(alert)
             continue
 
         if _prices_changed(record.snapshot, event):
@@ -191,8 +227,38 @@ def detect_changes(
     return alerts
 
 
-def _prices_changed(before: EventSnapshot, after: EventSnapshot) -> bool:
+def _wanted(enabled_set: Optional[set], kind: str) -> bool:
+    return enabled_set is None or kind in enabled_set
+
+
+def _first_wanted(enabled_set: Optional[set], *kinds: str) -> Optional[str]:
+    """The most specific enabled kind, or None if the user wants none of them."""
+    for kind in kinds:
+        if _wanted(enabled_set, kind):
+            return kind
+    return None
+
+
+def _prices_changed(before, after) -> bool:
     return (before.price_min, before.price_max) != (after.price_min, after.price_max)
+
+
+def _price_drop(before, after, percent: float) -> Optional[str]:
+    """A meaningful drop in the cheapest price, described for humans."""
+    old, new = before.price_min, after.price_min
+    if old is None or new is None or new >= old:
+        return None
+    if getattr(before, "currency", "") != getattr(after, "currency", ""):
+        return None  # not comparable
+    drop = old - new
+    if percent > 0 and drop < old * (percent / 100.0):
+        return None
+    currency = f" {after.currency}" if after.currency else ""
+    return f"{drop:.2f}{currency} ({drop / old * 100:.0f}%)"
+
+
+def _new_platforms(before, after) -> List[str]:
+    return sorted(set(getattr(after, "platforms", [])) - set(getattr(before, "platforms", [])))
 
 
 def _parse(value: Optional[str]) -> Optional[datetime]:

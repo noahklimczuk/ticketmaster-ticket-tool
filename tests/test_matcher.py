@@ -4,7 +4,7 @@ import unittest
 
 from tests.support import event_payload
 from ticketwatch.events import EventSnapshot
-from ticketwatch.matcher import artist_matches, city_matches, filter_events, normalize
+from ticketwatch.matcher import artist_matches, canonical_city, city_matches, filter_events, normalize
 
 
 def snap(**kwargs) -> EventSnapshot:
@@ -38,6 +38,18 @@ class CityTests(unittest.TestCase):
 
     def test_blank_event_city_never_matches_a_requested_city(self):
         self.assertFalse(city_matches("", ["Toronto"]))
+
+
+class CanonicalCityTests(unittest.TestCase):
+    def test_boroughs_fold_onto_their_city(self):
+        for borough in ("North York", "Scarborough", "Etobicoke", "TORONTO"):
+            self.assertEqual(canonical_city(borough), "toronto")
+
+    def test_an_unknown_city_is_just_normalised(self):
+        self.assertEqual(canonical_city("Saint John's"), "saint john s")
+
+    def test_blank(self):
+        self.assertEqual(canonical_city(""), "")
 
 
 class ArtistTests(unittest.TestCase):

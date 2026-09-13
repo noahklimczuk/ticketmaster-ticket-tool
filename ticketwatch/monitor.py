@@ -8,15 +8,16 @@ import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from .aggregate import MergedEvent, merge_listings
 from .alerts import Alert, detect_changes, error_alert
 from .config import Config
-from .events import EventSnapshot, now_utc
-from .matcher import filter_events
+from .events import now_utc
+from .matcher import filter_listings
 from .notify import Dispatcher
+from .providers.base import Listing, Provider, ProviderQuery, ProviderResult
 from .state import StateStore
-from .ticketmaster import AuthError, DiscoveryClient, NotEntitled, RateLimited, TicketmasterError
 
 LOG = logging.getLogger(__name__)
 
@@ -26,14 +27,24 @@ FAILURE_ALERT_THRESHOLD = 3
 
 @dataclass
 class CheckResult:
-    events: List[EventSnapshot] = field(default_factory=list)
+    events: List[MergedEvent] = field(default_factory=list)
     alerts: List[Alert] = field(default_factory=list)
+    providers: List[ProviderResult] = field(default_factory=list)
     error: Optional[str] = None
     retry_after: Optional[float] = None
     checked_at: Optional[datetime] = None
 
     @property
-    def buyable(self) -> List[EventSnapshot]:
+    def provider_errors(self) -> Dict[str, str]:
+        return {r.platform: r.error for r in self.providers if r.error}
+
+    @property
+    def cheapest(self) -> Optional[MergedEvent]:
+        priced = [e for e in self.buyable if e.price_min is not None]
+        return min(priced, key=lambda e: e.price_min) if priced else None
+
+    @property
+    def buyable(self) -> List[MergedEvent]:
         now = self.checked_at or now_utc()
         return [e for e in self.events if e.buyable(now)]
 
@@ -46,20 +57,22 @@ class Monitor:
     def __init__(
         self,
         config: Config,
-        client: DiscoveryClient,
+        providers: Sequence[Provider],
         store: StateStore,
         dispatcher: Dispatcher,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], datetime] = now_utc,
+        on_check: Optional[Callable[["CheckResult", float], None]] = None,
     ) -> None:
         self.config = config
-        self.client = client
+        self.providers = list(providers)
         self.store = store
         self.dispatcher = dispatcher
         self._sleep = sleep
         self._clock = clock
+        # Called with (result, seconds until the next poll) after every check.
+        self.on_check = on_check
         self._stop = False
-        self._inventory_supported = config.check_inventory
         self._consecutive_failures = 0
         self._failure_alert_sent = False
         self.checks = 0
@@ -76,64 +89,57 @@ class Monitor:
                 LOG.debug("Could not install handler for %s", sig)
 
     # ------------------------------------------------------------------ #
-    def fetch(self) -> List[EventSnapshot]:
+    def fetch(self) -> Tuple[List[MergedEvent], List[ProviderResult]]:
+        """Ask every configured platform, then fold the answers into one list."""
         cfg = self.config
-        raw = self.client.search_events(
-            keyword=cfg.keyword or None,
-            cities=cfg.cities if cfg.use_api_city_filter else None,
-            country_code=cfg.country_code if cfg.use_api_city_filter else None,
-            state_code=cfg.state_code if cfg.use_api_city_filter else None,
-            attraction_id=cfg.attraction_id,
-            venue_id=cfg.venue_id,
-            classification_name=cfg.classification_name,
-            radius=cfg.radius,
-            radius_unit=cfg.radius_unit,
-        )
-        snapshots = [EventSnapshot.from_api(item) for item in raw if isinstance(item, dict)]
-        matched = filter_events(
-            snapshots,
+        query = ProviderQuery(
             keyword=cfg.keyword,
             cities=cfg.cities,
+            country_code=cfg.country_code,
             attraction_id=cfg.attraction_id or "",
+            strict=cfg.strict_artist_match,
+        )
+        results = [provider.collect(query) for provider in self.providers]
+
+        listings: List[Listing] = []
+        for result in results:
+            listings.extend(result.listings)
+            if result.error:
+                LOG.warning("%s failed this round: %s", result.platform, result.error)
+
+        matched = filter_listings(
+            listings,
+            keyword=cfg.keyword,
+            cities=cfg.cities,
             strict=cfg.strict_artist_match,
             country_code=cfg.country_code or "",
         )
-        LOG.debug("Discovery returned %d events, %d matched the filters", len(snapshots), len(matched))
-
-        if self._inventory_supported and matched:
-            try:
-                statuses = self.client.inventory_status([e.id for e in matched])
-                for event in matched:
-                    event.inventory_status = statuses.get(event.id)
-            except NotEntitled as exc:
-                LOG.info("Inventory status unavailable for this API key, relying on sale dates (%s)", exc)
-                self._inventory_supported = False
-            except (RateLimited, AuthError):
-                raise
-            except TicketmasterError as exc:
-                LOG.warning("Inventory status check failed this round: %s", exc)
-        return matched
+        events = merge_listings(matched)
+        LOG.debug(
+            "%d listing(s) from %d platform(s) -> %d show(s)",
+            len(listings), len(results), len(events),
+        )
+        return events, results
 
     # ------------------------------------------------------------------ #
     def check_once(self, notify: bool = True) -> CheckResult:
         now = self._clock()
         self.checks += 1
-        try:
-            events = self.fetch()
-        except AuthError:
-            raise
-        except RateLimited as exc:
+
+        if not self.providers:
+            return CheckResult(error="No ticket platforms are configured", checked_at=now)
+
+        events, results = self.fetch()
+        working = [r for r in results if r.ok]
+        waits = [r.retry_after for r in results if r.retry_after]
+        retry_after = max(waits) if waits else None
+
+        if not working:
+            # Every platform is down or misconfigured; that is a real failure.
             self._consecutive_failures += 1
-            LOG.warning("Rate limited by Ticketmaster: %s", exc)
-            return CheckResult(
-                error=str(exc),
-                retry_after=exc.retry_after or self.config.interval_seconds * 4,
-                checked_at=now,
-            )
-        except TicketmasterError as exc:
-            self._consecutive_failures += 1
-            LOG.error("Check failed (%d in a row): %s", self._consecutive_failures, exc)
-            result = CheckResult(error=str(exc), checked_at=now)
+            detail = "; ".join(f"{r.platform}: {r.error}" for r in results)
+            LOG.error("Check failed (%d in a row): %s", self._consecutive_failures, detail)
+            result = CheckResult(error=detail, providers=results, retry_after=retry_after, checked_at=now)
             if (
                 notify
                 and self._consecutive_failures >= FAILURE_ALERT_THRESHOLD
@@ -141,8 +147,8 @@ class Monitor:
                 and "error" in self.config.alert_on
             ):
                 alert = error_alert(
-                    f"{self._consecutive_failures} consecutive failures talking to Ticketmaster.\n"
-                    f"Last error: {exc}\nStill retrying every {self.config.interval_seconds}s."
+                    f"{self._consecutive_failures} failed checks in a row.\n{detail}\n"
+                    f"Still retrying every {self.config.interval_seconds}s."
                 )
                 self.dispatcher.dispatch([alert])
                 self._failure_alert_sent = True
@@ -162,11 +168,14 @@ class Monitor:
             enabled=self.config.alert_on,
             repeat_minutes=self.config.repeat_alert_minutes,
             artist=self.config.keyword,
+            price_drop_percent=self.config.price_drop_percent,
         )
         if notify and alerts:
             self.dispatcher.dispatch(alerts)
         self.store.save(self.store.merge(previous, events, alerts, timestamp=now.isoformat()))
-        return CheckResult(events=events, alerts=alerts, checked_at=now)
+        return CheckResult(
+            events=events, alerts=alerts, providers=results, retry_after=retry_after, checked_at=now
+        )
 
     # ------------------------------------------------------------------ #
     def next_delay(self) -> float:
@@ -191,9 +200,6 @@ class Monitor:
             iterations += 1
             try:
                 result = self.check_once()
-            except AuthError as exc:
-                LOG.error("%s", exc)
-                raise
             except KeyboardInterrupt:  # pragma: no cover - interactive
                 self.request_stop()
                 break
@@ -212,6 +218,12 @@ class Monitor:
                 )
             else:
                 LOG.info("No matching events yet")
+
+            if self.on_check:
+                try:
+                    self.on_check(result, delay)
+                except Exception:  # pragma: no cover - a UI must never break the loop
+                    LOG.exception("on_check callback failed")
 
             if self._stop or (max_iterations is not None and iterations >= max_iterations):
                 break

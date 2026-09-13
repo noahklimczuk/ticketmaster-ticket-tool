@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -39,8 +40,10 @@ APP_PASSWORD_REQUIRED = {"smtp.gmail.com", "smtp.mail.yahoo.com", "smtp.mail.me.
 
 
 # Alert kinds that count as "you can spend money right now".
-BUYABLE_ALERTS = ("new_event", "on_sale", "presale", "back_in_stock", "low_inventory")
-ALL_ALERTS = BUYABLE_ALERTS + ("sold_out", "status_change", "price_change", "gone", "error")
+BUYABLE_ALERTS = ("new_event", "on_sale", "presale", "back_in_stock", "low_inventory", "cheaper")
+ALL_ALERTS = BUYABLE_ALERTS + (
+    "new_platform", "sold_out", "status_change", "price_change", "gone", "error",
+)
 
 
 class ConfigError(Exception):
@@ -117,6 +120,13 @@ class Config:
     # for the artist only and narrow the list ourselves in matcher.py.
     use_api_city_filter: bool = False
 
+    # --- other ticket platforms ------------------------------------------
+    # Each is optional; the tool works with Ticketmaster alone and lights up
+    # more price comparisons as you add credentials.
+    seatgeek_client_id: Optional[str] = None
+    seatgeek_currency: str = "USD"
+    bandsintown_app_id: str = "ticketwatch"
+
     # --- how often --------------------------------------------------------
     interval_seconds: int = 60
     jitter: float = 0.15
@@ -127,23 +137,49 @@ class Config:
     alert_on: List[str] = field(default_factory=lambda: list(BUYABLE_ALERTS))
     repeat_alert_minutes: int = 0
     check_inventory: bool = True
+    #: How far the cheapest price must fall before it is worth telling you.
+    price_drop_percent: float = 5.0
 
     # --- plumbing ---------------------------------------------------------
     # Overridable so the test suite (or a mock) can point somewhere else.
     discovery_base_url: str = "https://app.ticketmaster.com/discovery/v2"
     inventory_base_url: str = "https://app.ticketmaster.com/inventory-status/v1"
+    seatgeek_base_url: str = "https://api.seatgeek.com/2/events"
+    bandsintown_base_url: str = "https://rest.bandsintown.com"
     state_file: str = "state.json"
     log_level: str = "INFO"
     log_file: Optional[str] = None
     notifiers: NotifierSettings = field(default_factory=NotifierSettings)
 
     # ------------------------------------------------------------------ #
+    @property
+    def enabled_platforms(self) -> List[str]:
+        names = []
+        if self.api_key:
+            names.append("ticketmaster")
+        if self.seatgeek_client_id:
+            names.append("seatgeek")
+        if self.bandsintown_app_id:
+            names.append("bandsintown")
+        return names
+
+    @property
+    def primary_platforms(self) -> List[str]:
+        """Platforms that can actually tell us about buying a ticket.
+
+        Bandsintown is a discovery supplement with a self-chosen app id, so it
+        does not on its own count as having configured the tool.
+        """
+        return [name for name in self.enabled_platforms if name != "bandsintown"]
+
     def validate(self) -> None:
-        if not self.api_key:
+        if not self.primary_platforms:
             raise ConfigError(
-                "No Ticketmaster API key. Get a free one at "
+                "No ticket platform is configured. Get a free Ticketmaster API key at "
                 "https://developer.ticketmaster.com/ then set TICKETMASTER_API_KEY "
-                "or put \"api_key\" in your config file."
+                "or put \"api_key\" in your config file. "
+                "SeatGeek (seatgeek_client_id) and Bandsintown (bandsintown_app_id) "
+                "are optional extras for price comparison and new dates."
             )
         if self.interval_seconds < 5:
             raise ConfigError("interval_seconds must be at least 5")
@@ -168,6 +204,8 @@ class Config:
         data = to_dict(self)
         if data.get("api_key"):
             data["api_key"] = "***"
+        if data.get("seatgeek_client_id"):
+            data["seatgeek_client_id"] = "***"
         notifiers = data.get("notifiers", {})
         if notifiers.get("smtp_password"):
             notifiers["smtp_password"] = "***"
@@ -237,6 +275,16 @@ def load_config_file(path: Path) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ConfigError(f"{path} must contain a JSON object")
     return data
+
+
+def write_config_file(path: Path, data: Dict[str, Any]) -> None:
+    """Write a config file and lock it down - it can hold a key and a password."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    except OSError:  # pragma: no cover - unusual filesystems
+        pass
 
 
 def find_default_config(start: Optional[Path] = None) -> Optional[Path]:

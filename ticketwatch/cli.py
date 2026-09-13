@@ -26,6 +26,7 @@ from .config import (
 from .events import EventSnapshot, now_utc
 from .matcher import filter_events
 from .monitor import Monitor
+from .providers import build_providers
 from .notify import EmailNotifier, build_dispatcher
 from .state import StateStore
 from .ticketmaster import AuthError, DiscoveryClient, TicketmasterError
@@ -75,6 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--attraction-id", help="Exact Ticketmaster attraction id (see: ticketwatch resolve)")
     common.add_argument("--venue-id", help="Restrict to one Ticketmaster venue id")
     common.add_argument("--state-file", help="Where to remember what we have already seen")
+    common.add_argument("--seatgeek-id", dest="seatgeek_client_id", metavar="ID",
+                        help="SeatGeek client ID, to compare prices against Ticketmaster")
+    common.add_argument("--bandsintown-id", dest="bandsintown_app_id", metavar="ID",
+                        help="Bandsintown app id, for dates other platforms have not listed yet")
+    common.add_argument("--no-bandsintown", dest="bandsintown_app_id", action="store_const", const="",
+                        help="Skip Bandsintown")
     common.add_argument("--no-inventory", dest="check_inventory", action="store_false", default=None,
                         help="Skip the inventory-status call (sale dates only)")
     common.add_argument("--loose-match", dest="strict_artist_match", action="store_false", default=None,
@@ -138,6 +145,14 @@ def build_parser() -> argparse.ArgumentParser:
                              help="For local relays (or Proton Bridge) that do not use STARTTLS")
     setup_email.add_argument("--no-test", action="store_true", help="Skip the test email")
 
+    gui = sub.add_parser("gui", parents=[common, notify], help="Open the point-and-click control panel")
+    gui.add_argument("-i", "--interval", dest="interval_seconds", type=int, metavar="SECONDS")
+    gui.add_argument("--port", type=int, default=8765, help="Default: 8765")
+    gui.add_argument("--host", default="127.0.0.1",
+                     help="Default: this machine only. Use 0.0.0.0 to reach it from your phone")
+    gui.add_argument("--no-open", action="store_true", help="Do not open a browser window")
+    gui.add_argument("--start", action="store_true", help="Begin watching straight away")
+
     init = sub.add_parser("init", help="Write a starter config.json")
     init.add_argument("path", nargs="?", default="config.json")
     init.add_argument("--force", action="store_true", help="Overwrite an existing file")
@@ -148,7 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
 CONFIG_KEYS = {
     "api_key", "keyword", "cities", "country_code", "attraction_id", "venue_id", "state_file",
     "check_inventory", "strict_artist_match", "log_level", "log_file", "interval_seconds",
-    "repeat_alert_minutes",
+    "repeat_alert_minutes", "seatgeek_client_id", "bandsintown_app_id", "price_drop_percent",
 }
 NOTIFIER_KEYS = {
     "ntfy_topic", "ntfy_server", "webhook_url", "email_to", "command", "open_browser", "desktop", "console",
@@ -179,15 +194,21 @@ def setup_logging(level: str, log_file: Optional[str] = None) -> None:
     )
 
 
-def load(args: argparse.Namespace) -> Config:
+def config_path_for(args: argparse.Namespace) -> Optional[Path]:
     path = Path(args.config).expanduser() if getattr(args, "config", None) else find_default_config()
     if path is not None and not path.is_file():
         raise ConfigError(f"Config file not found: {path}")
+    return path
+
+
+def load(args: argparse.Namespace, validate: bool = True) -> Config:
+    path = config_path_for(args)
     cfg = build_config(config_path=path, cli_overrides=overrides_from_args(args))
     setup_logging(cfg.log_level, cfg.log_file)
     if path:
         LOG.debug("Loaded config from %s", path)
-    cfg.validate()
+    if validate:
+        cfg.validate()
     return cfg
 
 
@@ -201,11 +222,14 @@ def make_client(cfg: Config) -> DiscoveryClient:
     )
 
 
-def make_monitor(cfg: Config) -> Monitor:
-    client = make_client(cfg)
-    store = StateStore(cfg.state_file)
-    dispatcher = build_dispatcher(cfg.notifiers)
-    return Monitor(cfg, client, store, dispatcher)
+def make_monitor(cfg: Config, on_check=None) -> Monitor:
+    return Monitor(
+        cfg,
+        build_providers(cfg),
+        StateStore(cfg.state_file),
+        build_dispatcher(cfg.notifiers),
+        on_check=on_check,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -226,6 +250,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     )
     if quota > 5000:
         LOG.warning("That interval will exceed the free daily quota - consider --interval 60 or higher")
+    LOG.info("Platforms: %s", ", ".join(p.label for p in monitor.providers) or "none!")
     LOG.info("Alerting via: %s", ", ".join(monitor.dispatcher.channel_names) or "nothing configured!")
 
     max_checks = 1 if getattr(args, "once", False) else getattr(args, "max_checks", None)
@@ -258,6 +283,7 @@ def cmd_check(args: argparse.Namespace) -> int:
                 "error": result.error,
                 "events": [e.to_dict() for e in result.events],
                 "buyable": [e.id for e in result.buyable],
+                "platform_errors": result.provider_errors,
                 "alerts": [{"kind": a.kind, "title": a.title, "body": a.body, "url": a.url} for a in result.alerts],
             },
             indent=2,
@@ -267,6 +293,8 @@ def cmd_check(args: argparse.Namespace) -> int:
             print(f"error: {result.error}", file=sys.stderr)
             return EXIT_ERROR
         print_events(result.events, result.checked_at)
+        for platform, message in result.provider_errors.items():
+            print(f"  note: {platform} unavailable this check ({message})", file=sys.stderr)
     if result.error:
         return EXIT_ERROR
     return EXIT_OK if result.buyable else EXIT_NOT_AVAILABLE
@@ -374,6 +402,24 @@ def cmd_status(args: argparse.Namespace) -> int:
     for event_id, record in records.items():
         if record.last_alert_at:
             print(f"  last alert for {event_id}: {record.last_alert_kind} at {record.last_alert_at}")
+    return EXIT_OK
+
+
+def cmd_gui(args: argparse.Namespace) -> int:
+    from .gui import serve
+
+    # The panel is how you enter your API key, so it must open without one.
+    cfg = load(args, validate=False)
+    # Settings you change in the panel are saved here.
+    path = config_path_for(args) or Path("config.json")
+    serve(
+        cfg,
+        config_path=path,
+        host=args.host,
+        port=args.port,
+        open_browser=not args.no_open,
+        autostart=args.start,
+    )
     return EXIT_OK
 
 
@@ -506,13 +552,19 @@ def print_events(events: List[EventSnapshot], now=None) -> None:
             print(f"          {event.url}")
 
 
-def normalize_argv(argv: List[str]) -> List[str]:
+def default_command() -> str:
+    """Someone who double-clicked the packaged app wants the panel, not a log."""
+    return "gui" if getattr(sys, "frozen", False) else "watch"
+
+
+def normalize_argv(argv: List[str], default: Optional[str] = None) -> List[str]:
     """`ticketwatch` and `ticketwatch --once` both mean `ticketwatch watch ...`."""
     argv = list(argv)
+    fallback = default or default_command()
     if not argv:
-        return ["watch"]
+        return [fallback]
     if argv[0].startswith("-") and argv[0] not in ("-h", "--help", "--version"):
-        return ["watch"] + argv
+        return [fallback] + argv
     return argv
 
 
@@ -526,20 +578,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         "resolve": cmd_resolve,
         "test-notify": cmd_test_notify,
         "setup-email": cmd_setup_email,
+        "gui": cmd_gui,
         "status": cmd_status,
         "init": cmd_init,
     }
     handler = handlers[args.command_name]
+    code = EXIT_ERROR
     try:
-        return handler(args)
+        code = handler(args)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
-        return EXIT_ERROR
     except TicketmasterError as exc:
         print(f"ticketmaster error: {exc}", file=sys.stderr)
-        return EXIT_ERROR
     except KeyboardInterrupt:
-        return EXIT_OK
+        code = EXIT_OK
+    # A double-clicked .exe would otherwise vanish before the error is readable.
+    if code != EXIT_OK and getattr(sys, "frozen", False) and sys.stdin.isatty():
+        try:
+            input("\nPress Enter to close...")
+        except (EOFError, KeyboardInterrupt):
+            pass
+    return code
 
 
 if __name__ == "__main__":  # pragma: no cover

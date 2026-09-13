@@ -243,6 +243,11 @@ class EventSnapshot:
     # presentation
     # ---------------------------------------------------------------- #
     @property
+    def presale_label(self) -> str:
+        presale = self.active_presale()
+        return presale.name if presale else ""
+
+    @property
     def when(self) -> str:
         if not self.local_date:
             return "date TBA"

@@ -22,6 +22,22 @@ class DefaultsTests(unittest.TestCase):
             Config().validate()
         self.assertIn("developer.ticketmaster.com", str(ctx.exception))
 
+    def test_bandsintown_alone_is_not_enough(self):
+        """It finds dates but cannot price or sell anything."""
+        with self.assertRaises(ConfigError):
+            Config(bandsintown_app_id="ticketwatch").validate()
+
+    def test_seatgeek_alone_is_enough(self):
+        Config(seatgeek_client_id="abc").validate()
+
+    def test_platform_lists(self):
+        cfg = Config(api_key="k", seatgeek_client_id="s")
+        self.assertEqual(cfg.enabled_platforms, ["ticketmaster", "seatgeek", "bandsintown"])
+        self.assertEqual(cfg.primary_platforms, ["ticketmaster", "seatgeek"])
+
+    def test_seatgeek_id_is_redacted_too(self):
+        self.assertEqual(Config(api_key="k", seatgeek_client_id="secret").redacted()["seatgeek_client_id"], "***")
+
     def test_absurd_intervals_are_rejected(self):
         with self.assertRaises(ConfigError):
             Config(api_key="k", interval_seconds=1).validate()
